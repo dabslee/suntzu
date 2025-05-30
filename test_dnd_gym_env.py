@@ -1,8 +1,11 @@
 import pytest
 import numpy as np
-from gymnasium import spaces # Import the 'spaces' module
-from dnd_gym_env import Creature, DnDCombatEnv # Assuming dnd_gym_env.py is in the same directory
-from dice import roll # Assuming dice.py is in the same directory
+import os # For skipping human render test in headless CI
+from gymnasium import spaces 
+from dnd_gym_env import Creature, DnDCombatEnv 
+from dice import roll 
+from bestiary.commoner import get_commoner_stats # For render tests
+from bestiary.wolf import get_wolf_stats     # For render tests
 
 # --- Test Creature Class ---
 
@@ -243,28 +246,43 @@ def test_step_agent_attack_enemy_ko(dnd_env, agent_stats_env):
     # For now, rely on high damage dice to KO if a hit occurs.
     # If this test is flaky, dice mocking for the attack roll is the next step.
     
+    # Calculate expected damage: enemy has 1 HP, so damage dealt is 1.
+    # If make_attack was mocked to always hit and deal exact damage, this would be more precise.
+    # For now, we assume the +50 damage ensures a KO. The actual damage_dealt for reward will be 1.
+    # The damage dealt component of reward is based on actual HP lost.
+    damage_to_ko_enemy = dnd_env.enemy.current_hp 
+    
     obs, reward, terminated, truncated, info = dnd_env.step(attack_action_idx)
     
-    # If the attack missed, this test part is invalid.
-    # We assume it hits for KO test. A more robust test would control the hit.
     if dnd_env.enemy.is_alive:
-        print("Warning: Agent attack missed in KO test, test may not be conclusive.")
-        pytest.skip("Agent attack missed, cannot verify KO deterministically without mocking.")
+        # This might happen if the attack roll (1d20 + to_hit) misses.
+        # For this test to be robust, we need a guaranteed hit or mock dice.
+        # Given the high damage_dice, a hit is almost certain to KO.
+        pytest.skip("Agent attack missed in KO test, cannot verify precise reward. Consider dice mocking for robustness.")
 
-
-    assert terminated is True
-    assert dnd_env.enemy.is_alive is False
-    assert reward > 0 # Should be positive for KOing enemy (e.g. 50 - 0.05)
+    assert terminated is True, "Episode should be terminated after enemy KO"
+    assert dnd_env.enemy.is_alive is False, "Enemy should be KO'd"
+    
+    # Expected reward: -0.1 (step) + damage_to_ko_enemy (actual_hp_lost) + 100 (win)
+    # Survival reward is not added here because the agent's action terminated the episode.
+    expected_reward = -0.1 + damage_to_ko_enemy + 100
+    assert reward == pytest.approx(expected_reward), f"Reward for KOing enemy is incorrect. Got {reward}, expected {expected_reward}"
     assert obs["enemy_hp_norm"][0] == 0.0
 
 
-def test_step_enemy_attack_agent_ko(dnd_env, enemy_stats_env):
+def test_step_enemy_attack_agent_ko(dnd_env, enemy_stats_env): # agent_stats_env is implicitly used by dnd_env fixture
     dnd_env.reset(seed=2)
     dnd_env.agent.position = [0,0]
     dnd_env.enemy.position = [0,1] # Adjacent
-    dnd_env.agent.current_hp = 1 # Agent has 1 HP
-    dnd_env.agent.max_hp = 1
-    dnd_env.enemy.attacks[0]['damage_dice'] = "1d4+50" # Enemy lethal attack
+    
+    # Agent has 1 HP, so damage taken to KO is 1.
+    dnd_env.agent.current_hp = 1 
+    dnd_env.agent.max_hp = 1 # Setting max_hp to 1 for consistency in this test
+    
+    # Ensure enemy attack is lethal enough if it hits.
+    # The default scimitar "1d6+2" is likely to be >1.
+    # No need to change enemy_stats_env['attacks'][0]['damage_dice'] if it's already strong enough.
+    # damage_taken_to_ko_agent = dnd_env.agent.current_hp # which is 1
 
     # Agent passes turn, allowing enemy to act
     pass_action_idx = -1
@@ -276,13 +294,24 @@ def test_step_enemy_attack_agent_ko(dnd_env, enemy_stats_env):
     
     obs, reward, terminated, truncated, info = dnd_env.step(pass_action_idx)
 
+    # If agent is still alive, it means the enemy's attack missed.
     if dnd_env.agent.is_alive:
-        print("Warning: Enemy attack missed in KO test, test may not be conclusive.")
-        pytest.skip("Enemy attack missed, cannot verify KO deterministically without mocking.")
+        pytest.skip("Enemy attack missed agent in KO test, cannot verify precise reward. Consider dice mocking for robustness.")
 
-    assert terminated is True
-    assert dnd_env.agent.is_alive is False
-    assert reward < 0 # Should be negative for agent KO (e.g. -50 - 0.05)
+    assert terminated is True, "Episode should be terminated after agent KO"
+    assert dnd_env.agent.is_alive is False, "Agent should be KO'd"
+    
+    # Expected reward components:
+    # -0.1 (step penalty for agent's pass action)
+    # +0.5 (agent survival after its pass action)
+    # -1 (damage taken by agent, since agent_hp was 1)
+    # -100 (loss penalty)
+    # Total = -0.1 + 0.5 - 1 - 100 = -100.6
+    # The damage_taken_by_agent is implicitly 1 because current_hp was 1.
+    damage_taken_to_ko_agent = 1 # Based on setup current_hp=1
+    expected_reward = -0.1 + 0.5 - damage_taken_to_ko_agent - 100
+    
+    assert reward == pytest.approx(expected_reward), f"Reward for agent KO is incorrect. Got {reward}, expected {expected_reward}"
     assert obs["agent_hp_norm"][0] == 0.0
 
 
@@ -317,7 +346,216 @@ def test_step_movement(dnd_env):
     expected_new_pos = [initial_pos[0] + expected_delta[0], initial_pos[1] + expected_delta[1]]
     
     assert np.array_equal(obs["agent_pos"], expected_new_pos)
-    assert reward == -0.05 # Small step penalty
+    # Expected reward: -0.1 (step penalty) + 0.5 (survival reward) = 0.4
+    assert reward == pytest.approx(0.4), "Reward for simple move action is incorrect"
+    assert terminated is False
+
+def test_agent_move_into_occupied_cell(dnd_env):
+    dnd_env.reset(seed=6)
+    # Place agent and enemy adjacent
+    dnd_env.agent.position = [0, 0]
+    dnd_env.enemy.position = [0, 1] # Enemy to the South
+    initial_agent_speed = dnd_env.agent.speed_total
+    dnd_env.agent.speed_remaining = initial_agent_speed
+
+    # Find action for agent to move South (into enemy)
+    move_south_action_idx = -1
+    for i, action_def in enumerate(dnd_env.action_map):
+        if action_def["type"] == "move" and action_def["name"] == "move_S":
+            move_south_action_idx = i
+            break
+    assert move_south_action_idx != -1
+
+    obs, reward, terminated, truncated, info = dnd_env.step(move_south_action_idx)
+
+    assert np.array_equal(obs["agent_pos"], [0, 0]), "Agent should not have moved"
+    # Agent attempted to move 1 cell, so 1 speed point should be consumed.
+    assert dnd_env.agent.speed_remaining == initial_agent_speed - 1, "Agent speed not deducted correctly for failed move"
+    assert terminated is False
+
+def test_enemy_move_into_occupied_cell(dnd_env, enemy_stats_env): # Add enemy_stats_env fixture
+    dnd_env.reset(seed=7)
+    
+    # Modify enemy to have no attacks for this test, to force movement attempt
+    original_enemy_attacks = dnd_env.enemy.attacks
+    dnd_env.enemy.attacks = []
+
+    # Place agent and enemy adjacent
+    dnd_env.agent.position = [0, 1] 
+    dnd_env.enemy.position = [0, 0] # Enemy North of Agent, wants to move to [0,1] (agent's spot)
+    initial_enemy_speed = dnd_env.enemy.speed_total
+    dnd_env.enemy.speed_remaining = initial_enemy_speed # Ensure enemy has speed
+
+
+    # Agent passes, so enemy gets to move
+    pass_action_idx = -1
+    for i, action_def in enumerate(dnd_env.action_map):
+        if action_def["type"] == "pass":
+            pass_action_idx = i
+            break
+    assert pass_action_idx != -1
+    
+    obs, reward, terminated, truncated, info = dnd_env.step(pass_action_idx)
+
+    # Enemy AI: if adjacent and no attacks, it should attempt to move.
+    # If it had attacks, it would attack. Since no attacks, it should try to move.
+    # The default AI moves if not adjacent OR if it cannot attack.
+    # Current AI: if dist_to_agent == 1: if self.enemy.attacks: ATTACK else: (no explicit move)
+    # This means if adjacent and no attacks, it does nothing.
+    # We need to ensure the "else (not adjacent)" part of AI is triggered, OR that the "adjacent" part tries to move if no attacks.
+
+    # Let's adjust AI slightly for this test or setup:
+    # For this test, we need the enemy to try to move into agent's cell.
+    # The AI logic is: if adjacent, attack. Else, move.
+    # If attacks are empty, it won't attack. It will then fall through and NOT move if adjacent.
+    # This test is still problematic for the current AI.
+
+    # Re-evaluate: The code for enemy movement (dx, dy towards agent) has paths for collision.
+    # if [enemy_target_x_try1, enemy_target_y_try1] == self.agent.position:
+    #    self.enemy.speed_remaining -= enemy_move_cost
+    # This code is in the `else` (not adjacent) block of the enemy AI.
+    # So, for this test to be effective, the enemy MUST NOT be adjacent.
+
+    # New setup: Enemy at [0,0], Agent at [0,2]. Enemy wants to move to [0,1]. This is not occupied.
+    # This test should be: enemy wants to move to [0,1], but agent is ALREADY at [0,1]. Enemy starts at [0,0].
+    # This makes them adjacent. The AI will attack if it can.
+    # If enemy has no attacks, it does nothing if adjacent.
+
+    # The simplest way to test the "enemy move blocked by agent" code path
+    # is to ensure the enemy is NOT adjacent, but its desired single step (e.g. dx part)
+    # would land on the agent.
+    
+    dnd_env.agent.position = [1,0] # Agent at [1,0]
+    dnd_env.enemy.position = [0,0] # Enemy at [0,0], wants to move to dx=1 -> [1,0]
+
+    # Now dist is 1. Enemy AI with no attacks will do nothing.
+    # We need to modify the AI or the test.
+    # Let's assume for this test, enemy AI always tries to move if it cannot attack.
+    # This requires a small temporary modification to the environment's AI logic,
+    # or more simply, accept that this specific code path in enemy AI (move into agent spot)
+    # is hard to test without AI modification if it prioritizes attacks/does nothing else.
+
+    # For now, let's assume the test setup was trying to verify the collision code itself,
+    # not the complex interaction with AI decision-making if AI avoids the situation.
+    # The previous run failed because speed was not deducted. This means the enemy did not attempt the move.
+    # This was because it was adjacent and attacked (or would have if it had attacks).
+    # If we remove its attacks, and it's adjacent, current AI does nothing.
+
+    # The fix for the failed test is that the enemy AI logic needs to be changed
+    # OR the test needs to be more creative.
+    # The existing code for speed deduction on collision IS present in the dnd_gym_env.
+    # The failure is that this code path wasn't hit by the AI.
+
+    # Let's restore original attacks for now and acknowledge this test needs refinement
+    # if the goal is to test the enemy AI's specific collision path.
+    # The assertion failure (5 == 4) means speed was NOT deducted.
+    # This is correct if the enemy AI decided to attack or do nothing instead of moving.
+    
+    # If enemy attacked, its speed is reset at start of its turn, then unchanged by attack.
+    # If enemy had no attacks and was adjacent, it did nothing, speed unchanged.
+    # The test is flawed because it assumes the enemy *will* attempt to move into the agent's square.
+
+    # To make the test pass with current AI, we'd assert speed is UNCHANGED if adjacent.
+    # But that's not testing "move into occupied cell".
+    # Let's force non-adjacency where the target *would* be the agent cell.
+    dnd_env.enemy.attacks = [] # No attacks
+    dnd_env.agent.position = [1, 0] # Agent
+    dnd_env.enemy.position = [-1, 0] # Enemy, wants to move to [0,0], then to [1,0] (agent)
+                                    # This is too complex for current 1-step AI.
+
+    # Simplest: Enemy at [0,0], Agent at [1,0]. Enemy has NO attacks.
+    # Current AI: dist=1. Has attacks? No. Does nothing. Speed not deducted. Test fails.
+    # This test was previously skipped due to AI complexity.
+    # New approach: Enemy has no attacks, is NOT adjacent, but its path is to the agent's square.
+    dnd_env.enemy.attacks = [] # Ensure enemy must move if it wants to act
+
+    # Enemy at [0,0], Agent at [0,1]. Enemy wants to move South to [0,1].
+    # This makes them non-adjacent for the AI's "attack first" logic if dist=1.
+    # Enemy AI: if dist != 1, it will try to move.
+    # Let's set them up so dist > 1, but one step of enemy move targets agent's square.
+    # No, this is not right. The collision logic in enemy AI is for when its target dx/dy lands on agent.
+    # The AI calculates dx, dy to agent. Then calculates target_x, target_y for its step.
+    # This target_x, target_y is then checked against agent.position.
+
+    dnd_env.agent.position = [0, 1]  # Agent
+    dnd_env.enemy.position = [0, 0]  # Enemy one step North of Agent
+    # Enemy AI will determine dx=0, dy=1. Target will be [0,1] (Agent's spot).
+    # Since enemy has no attacks, its "if self.enemy.attacks:" check (if dist==1) fails.
+    # The current AI when dist==1 and no attacks will do nothing.
+    
+    # To test the collision:
+    # 1. Enemy must not be adjacent (so it enters move logic)
+    # 2. Its calculated 1-step move (e.g. dx_component, then dy_component) must land on agent.
+    
+    dnd_env.agent.position = [1, 2]    # Agent
+    dnd_env.enemy.position = [0, 2]    # Enemy West of Agent, dist = 1
+                                       # AI: dx=1, dy=0. Target [1,2]
+    # This is still adjacent. The AI will not move if it has no attacks and is adjacent.
+
+    # Let's make enemy non-adjacent, but its first move component (e.g. x-axis) lands on agent
+    dnd_env.agent.position = [1,0]     # Agent
+    dnd_env.enemy.position = [0,0]     # Enemy. Wants to move to [1,0] (dx=1).
+    initial_enemy_pos = list(dnd_env.enemy.position)
+    initial_enemy_speed = dnd_env.enemy.speed_total
+    dnd_env.enemy.speed_remaining = initial_enemy_speed
+    
+    # This setup is dist=1. If enemy has no attacks, it does nothing.
+    # If enemy HAS attacks, it attacks.
+    # The collision code for enemy move is in the `else` (not adjacent) part of AI.
+
+    # New strategy: Enemy is not adjacent, but its path (x-component) is blocked by agent.
+    dnd_env.agent.position = [1,0]  # Agent
+    dnd_env.enemy.position = [0,0]  # Enemy at [0,0]
+    dnd_env.enemy.attacks = []      # Enemy has no attacks, must move.
+    
+    # Manually set enemy further away so its move logic gets triggered
+    dnd_env.enemy.position = [-1, 0] # Enemy is at [-1,0], agent at [1,0]. Dist = 2.
+                                     # Enemy wants dx=1 (to [0,0]), then dx=1 again (to [1,0])
+    initial_enemy_pos_far = list(dnd_env.enemy.position)
+    initial_enemy_speed = dnd_env.enemy.speed_total # Should be 5 from fixture
+    dnd_env.enemy.speed_remaining = initial_enemy_speed
+
+    # Agent passes
+    obs, reward, terminated, truncated, info = dnd_env.step(pass_action_idx)
+    
+    # Enemy's first move: dx=1, dy=0. New pos should be [0,0]. Speed should be initial_enemy_speed - 1
+    assert np.array_equal(dnd_env.enemy.position, [0,0]), "Enemy should have moved one step closer"
+    assert dnd_env.enemy.speed_remaining == initial_enemy_speed - 1 
+
+    # Now enemy is at [0,0], agent at [1,0]. Enemy speed is initial_enemy_speed - 1.
+    # Agent passes again
+    obs, reward, terminated, truncated, info = dnd_env.step(pass_action_idx)
+
+    # Enemy's second move: dx=1, dy=0. Target is [1,0] (agent's position).
+    # This move should be blocked by the agent. Enemy position remains [0,0]. 
+    # Speed was reset to initial_enemy_speed at the start of this (enemy's second) turn, then 1 is deducted for collision.
+    assert np.array_equal(dnd_env.enemy.position, [0,0]), "Enemy should not have moved (blocked by agent)"
+    print(f"DEBUG_TEST: Enemy speed before final assertion: {dnd_env.enemy.speed_remaining}, expected: {initial_enemy_speed - 1}")
+    assert dnd_env.enemy.speed_remaining == initial_enemy_speed - 1, "Enemy speed not deducted correctly for collision in the second turn"
+    assert terminated is False
+    
+    dnd_env.enemy.attacks = original_enemy_attacks # Restore attacks
+
+
+def test_agent_move_into_wall_consumes_speed(dnd_env):
+    dnd_env.reset(seed=8)
+    # Place agent at an edge, e.g., North edge
+    dnd_env.agent.position = [0, 0]
+    initial_agent_speed = dnd_env.agent.speed_total
+    dnd_env.agent.speed_remaining = initial_agent_speed
+
+    # Find action for agent to move North (into wall)
+    move_north_action_idx = -1
+    for i, action_def in enumerate(dnd_env.action_map):
+        if action_def["type"] == "move" and action_def["name"] == "move_N":
+            move_north_action_idx = i
+            break
+    assert move_north_action_idx != -1
+
+    obs, reward, terminated, truncated, info = dnd_env.step(move_north_action_idx)
+
+    assert np.array_equal(obs["agent_pos"], [0, 0]), "Agent should not have moved"
+    assert dnd_env.agent.speed_remaining == initial_agent_speed - 1, "Agent speed not deducted for bumping wall"
     assert terminated is False
 
 
@@ -370,7 +608,8 @@ def test_action_decoding_and_mapping(dnd_env):
             pytest.fail(f"Unknown decoded action type: {decoded_action['type']}")
 
 
-def test_rendering_ansi(dnd_env):
+def test_rendering_ansi(dnd_env): # dnd_env fixture has render_mode=None by default
+    dnd_env.render_mode = 'ansi' # Explicitly set to ansi for this test
     dnd_env.reset(seed=5)
     try:
         # The current render prints to stdout and returns the string.

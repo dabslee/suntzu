@@ -1,8 +1,14 @@
-from typing import List, Dict, Callable, Tuple, Optional, Any
+from typing import List, Dict, Callable, Tuple, Optional, Any, Union
 import random
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
+
+# Pygame import (optional)
+try:
+    import pygame
+except ImportError:
+    pygame = None # Flag to indicate Pygame is not available
 
 # Assuming dice.py is in the same directory or PYTHONPATH
 try:
@@ -55,23 +61,24 @@ class Creature:
     def make_attack(self, target_creature: 'Creature', attack_index: int, dice_roller: Callable[[str], int]) -> Tuple[bool, int]:
         """ Returns (hit_status, damage_dealt) """
         if not self.can_act() or not target_creature.can_act():
-            return False, 0
+            return False, 0 # (hit_status, damage_dealt)
 
         if not (0 <= attack_index < len(self.attacks)):
-            # This case should ideally be prevented by action space construction
             raise IndexError(f"attack_index {attack_index} out of bounds for {self.name}'s attacks.")
             
         selected_attack = self.attacks[attack_index]
         attack_roll_result = dice_roller("1d20") + selected_attack["to_hit"]
         
         damage_dealt = 0
-        hit = False
+        hit_status = False
         if attack_roll_result >= target_creature.ac:
-            hit = True
+            hit_status = True
             damage_dealt = dice_roller(selected_attack["damage_dice"])
-            if damage_dealt < 0: damage_dealt = 0 
+            if damage_dealt < 0: 
+                damage_dealt = 0 # Damage cannot be negative
             target_creature.take_damage(damage_dealt)
-        return hit, damage_dealt
+        
+        return hit_status, damage_dealt
 
     def move(self, dx: int, dy: int, map_width: int, map_height: int) -> bool:
         if not self.can_act(): return False
@@ -108,14 +115,52 @@ class Creature:
 
 
 class DnDCombatEnv(gym.Env):
-    metadata = {'render_modes': ['ansi'], 'render_fps': 4}
+    metadata = {'render_modes': ['ansi', 'human', 'rgb_array'], 'render_fps': 4}
 
-    def __init__(self, map_width: int, map_height: int, agent_stats: dict, enemy_stats: dict, grid_size: int = 1):
+    def __init__(self, map_width: int, map_height: int, agent_stats: dict, enemy_stats: dict, grid_size: int = 1, render_mode: Optional[str] = None):
         super().__init__()
 
         self.map_width = map_width
         self.map_height = map_height
         self.grid_size = grid_size # Feet per grid cell. Assume creature speeds are in cells for now.
+        
+        self.render_mode = render_mode
+        self.screen = None
+        self.clock = None
+        self.font = None
+        self.render_surface = None # For rgb_array
+        self.window_surface = None # Surface to draw on (screen or render_surface)
+        self.max_episode_steps = 100
+        
+        self.CELL_SIZE = 50
+        self.STATS_AREA_HEIGHT = 100
+        self.TEXT_COLOR = (200, 200, 200) # Light grey for text
+        self.AGENT_COLOR = (0, 128, 0)   # Dark Green
+        self.ENEMY_COLOR = (128, 0, 0)   # Dark Red
+        self.GRID_COLOR = (50, 50, 50)   # Dark Grey
+        self.BACKGROUND_COLOR = (0, 0, 0) # Black
+
+        if self.render_mode in ['human', 'rgb_array']:
+            if pygame is None:
+                raise ImportError("Pygame is not installed, but is required for 'human' or 'rgb_array' render modes. Please install it (e.g., pip install pygame).")
+            
+            pygame.font.init() # Initialize font module explicitly
+            self.font = pygame.font.Font(None, 24)
+            self.small_font = pygame.font.Font(None, 18) # For grid coordinates or smaller text
+
+            screen_width = self.map_width * self.CELL_SIZE
+            screen_height = self.map_height * self.CELL_SIZE + self.STATS_AREA_HEIGHT
+
+            if self.render_mode == 'human':
+                pygame.init() # Initialize all Pygame modules
+                pygame.display.set_caption("D&D Combat Environment")
+                self.screen = pygame.display.set_mode((screen_width, screen_height))
+                self.clock = pygame.time.Clock()
+                self.window_surface = self.screen
+            elif self.render_mode == 'rgb_array':
+                self.render_surface = pygame.Surface((screen_width, screen_height))
+                self.window_surface = self.render_surface
+
 
         # Ensure 'initial_position' is not passed directly if it's part of agent_stats to avoid TypeError
         # The actual initial position will be set in reset()
@@ -165,7 +210,7 @@ class DnDCombatEnv(gym.Env):
             # "agent_can_bonus_action": spaces.Discrete(2) # For simplicity, assume can bonus if alive
         })
         
-        self.render_mode = 'ansi' # Default, can be set by user
+        # self.render_mode = 'ansi' # Default, can be set by user # render_mode is now an __init__ param
 
     def _get_obs(self) -> Dict[str, Any]:
         agent_hp_norm = np.array([self.agent.current_hp / self.agent.max_hp if self.agent.max_hp > 0 else 0.0], dtype=np.float32)
@@ -198,6 +243,7 @@ class DnDCombatEnv(gym.Env):
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         super().reset(seed=seed)
+        self.current_episode_steps = 0
 
         # Randomly place agent and enemy, ensuring no overlap
         while True:
@@ -231,9 +277,10 @@ class DnDCombatEnv(gym.Env):
         return self.action_map[action_int]
 
     def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
+        self.current_episode_steps += 1
         terminated = False
-        truncated = False # Not used for now, could be for time limits
-        reward = -0.05 # Small penalty for existing / taking a turn
+        truncated = False 
+        reward = -0.1  # Overall step penalty
 
         decoded_action = self._decode_action(action)
 
@@ -250,29 +297,50 @@ class DnDCombatEnv(gym.Env):
 
             if decoded_action["type"] == "move":
                 dx, dy = decoded_action["delta"]
-                # For now, assume 1 unit of speed per 1 cell move action
-                if self.agent.speed_remaining >= 1: # Cost of this move action
-                    if self.agent.move(dx, dy, self.map_width, self.map_height):
-                        action_taken_successfully = True
-                        # Simple reward for moving: if it changes distance to enemy
-                        # This is very basic, could be improved
-                        # reward += 0.01 # Small reward for successful move
-                # Note: self.agent.move already deducts speed. Here, we assume a "move action" uses 1 "action point"
-                # and allows movement up to creature's speed. The current setup is 1 cell per move action.
-                # This needs refinement if speed is to be a resource spent across multiple move actions.
-                # For now: one "move N/S/E/W" action costs 1 speed and moves 1 cell.
+                cost_for_this_move_action = 1 # Each "move direction" action attempts to move 1 cell costing 1 speed.
+                
+                if self.agent.speed_remaining >= cost_for_this_move_action:
+                    target_x = self.agent.position[0] + dx
+                    target_y = self.agent.position[1] + dy
+
+                    if [target_x, target_y] == self.enemy.position:
+                        # Cell is occupied by the enemy, move fails but speed is consumed for the attempt.
+                        self.agent.speed_remaining -= cost_for_this_move_action
+                        action_taken_successfully = True # Action was processed, though no position change.
+                        # Optionally, add a small negative reward for bumping into enemy
+                        # reward -= 0.01 
+                    elif self._is_valid_position(target_x, target_y): # Check bounds before calling creature.move
+                        # Creature.move will also check bounds and speed, but here we focus on occupation.
+                        # The cost_for_this_move_action (1) is what this specific action costs.
+                        # Creature.move itself will use its internal logic for speed deduction based on dx,dy.
+                        # Since dx,dy is 1 cell, Creature.move will deduct 1 speed.
+                        if self.agent.move(dx, dy, self.map_width, self.map_height):
+                             action_taken_successfully = True
+                        # If self.agent.move failed it means it hit a boundary or somehow still didn't have speed
+                        # (though we checked speed_remaining >= cost_for_this_move_action).
+                        # To ensure speed is consumed if Creature.move isn't called due to pre-check:
+                        # This path assumes Creature.move is the sole speed deducter if target not occupied.
+                    else:
+                        # Invalid target position (out of bounds), but attempt still costs speed.
+                        self.agent.speed_remaining -= cost_for_this_move_action
+                        action_taken_successfully = True # Action processed, resulted in hitting a wall.
+                else:
+                    # Not enough speed for the move action itself
+                    action_taken_successfully = False # Action could not be processed.
 
             elif decoded_action["type"] == "attack":
                 attack_idx = decoded_action["index"]
                 # Check distance for melee/ranged attacks - future improvement
                 # For now, assume any attack can be attempted.
-                hit, damage = self.agent.make_attack(self.enemy, attack_idx, self.dice_roller)
+                old_enemy_hp = self.enemy.current_hp
+                hit, _ = self.agent.make_attack(self.enemy, attack_idx, self.dice_roller) # Raw damage roll not used directly for reward
                 action_taken_successfully = True # Attempting an attack is an action
                 if hit:
-                    reward += damage * 0.1 # Reward scaled by damage
+                    actual_damage_dealt = old_enemy_hp - self.enemy.current_hp # Calculate actual HP lost
+                    reward += actual_damage_dealt
                 if not self.enemy.is_alive:
                     terminated = True
-                    reward += 50 # Large reward for defeating enemy
+                    reward += 100 # Win reward
             
             elif decoded_action["type"] == "bonus_action":
                 ba_name = decoded_action["name"]
@@ -300,13 +368,19 @@ class DnDCombatEnv(gym.Env):
                 pass
 
             if not action_taken_successfully:
-                reward -= 0.1 # Penalty for trying an invalid/impossible action (e.g. move with 0 speed)
+                # No additional penalty here beyond the initial -0.1 step penalty.
+                pass
+            
+            # Agent survival reward for this turn (if action didn't end episode)
+            if self.agent.is_alive and not terminated:
+                reward += 0.5
 
+        # If agent's action caused termination (e.g. enemy defeated by agent's attack)
         if terminated:
             return self._get_obs(), reward, terminated, truncated, self._get_info()
 
-        # Enemy's Turn (Simple AI)
-        if self.enemy.can_act():
+        # Enemy's Turn
+        if self.enemy.can_act(): # Check if enemy can act before its turn starts
             self.enemy.speed_remaining = self.enemy.speed_total # Reset enemy speed for its turn
 
             dist_to_agent = self._calculate_manhattan_distance(self.enemy.position, self.agent.position)
@@ -320,62 +394,210 @@ class DnDCombatEnv(gym.Env):
                     if not self.agent.is_alive:
                         terminated = True
                         reward -= 50 # Large penalty for agent defeat
-            else:
-                # Move enemy one step towards the agent
-                dx, dy = 0, 0
-                if self.agent.position[0] > self.enemy.position[0]: dx = 1
-                elif self.agent.position[0] < self.enemy.position[0]: dx = -1
-                
-                if self.agent.position[1] > self.enemy.position[1]: dy = 1
-                elif self.agent.position[1] < self.enemy.position[1]: dy = -1
+                # If adjacent but no attacks (or chose not to attack), then consider moving.
+                # This else is now tied to 'if self.enemy.attacks:'
+                # If there are no attacks, it will fall through to the movement logic below.
+                # To make it explicit: if it didn't attack (either no attacks or other reason), it might move.
+                # For simplicity, let's assume if it's adjacent and can't/doesn't attack, it will use the move logic.
+                # This requires restructuring slightly: the move logic should be callable if not attacking OR not adjacent.
 
-                # Try to move in x, then y, or prefer non-diagonal if stuck
-                moved = False
-                if dx != 0 and self.enemy.move(dx, 0, self.map_width, self.map_height):
-                    moved = True
-                elif dy != 0 and self.enemy.move(0, dy, self.map_width, self.map_height):
-                    moved = True
-                
-                # If stuck (e.g. dx=0 and dy move failed, or dx move failed and dy=0) try other axis if available
-                if not moved:
-                    if dx == 0 and dy != 0: # Was trying to move only in y, failed.
-                        pass # No other primary axis to try
-                    elif dy == 0 and dx != 0: # Was trying to move only in x, failed.
-                        pass # No other primary axis to try
-                    elif dx != 0 and dy != 0: # Was trying diagonal, one axis failed
-                        if not self.enemy.move(dx,0, self.map_width, self.map_height): # Try x first
-                           self.enemy.move(0,dy, self.map_width, self.map_height) # Then y
+            # Unified movement logic for enemy if it didn't attack (or isn't adjacent)
+            # Condition: if it's not adjacent OR (it is adjacent AND it did not attack)
+            # The 'did not attack' part is tricky if attacks list is empty.
+            # Let's simplify: if adjacent and has attacks, it attacks. Otherwise, it tries to move.
+            
+            enemy_attacked_this_turn = False
+            if dist_to_agent == 1 and self.enemy.attacks:
+                old_agent_hp = self.agent.current_hp
+                hit, _ = self.enemy.make_attack(self.agent, 0, self.dice_roller) # Raw damage roll not used directly
+                enemy_attacked_this_turn = True
+                if hit:
+                    actual_damage_taken = old_agent_hp - self.agent.current_hp # Calculate actual HP lost
+                    reward -= actual_damage_taken
+                if not self.agent.is_alive:
+                    terminated = True
+                    reward -= 100 # Loss penalty
+            
+            if not enemy_attacked_this_turn: # Move if not adjacent OR if adjacent but chose not/could not attack
+                # Cost for enemy's 1-cell move attempt
+                enemy_move_cost = 1 
+                if self.enemy.speed_remaining >= enemy_move_cost:
+                    dx, dy = 0, 0
+                    if self.agent.position[0] > self.enemy.position[0]: dx = 1
+                    elif self.agent.position[0] < self.enemy.position[0]: dx = -1
+                    
+                    if self.agent.position[1] > self.enemy.position[1]: dy = 1
+                    elif self.agent.position[1] < self.enemy.position[1]: dy = -1
 
+                    # Attempt to move towards agent, check occupation
+                    # Try x-axis move first
+                    enemy_target_x_try1 = self.enemy.position[0] + dx
+                    enemy_target_y_try1 = self.enemy.position[1]
+                    
+                    moved_enemy = False
+                    # X-axis movement attempt
+                    if dx != 0:
+                        target_x = self.enemy.position[0] + dx
+                        target_y = self.enemy.position[1]
+                        
+                        is_target_agent_occupied = ([target_x, target_y] == self.agent.position)
+                        is_target_map_valid = self._is_valid_position(target_x, target_y)
+
+                        can_move_to_target = is_target_map_valid and not is_target_agent_occupied
+                        if can_move_to_target:
+                            if self.enemy.move(dx, 0, self.map_width, self.map_height): # move() deducts speed
+                                moved_enemy = True
+                        
+                        if not can_move_to_target: # Collision with wall OR agent
+                            self.enemy.speed_remaining -= enemy_move_cost 
+                    
+                    # Y-axis movement attempt (only if no x-move occurred or dx was 0)
+                    if not moved_enemy and dy != 0:
+                        target_x = self.enemy.position[0]
+                        target_y = self.enemy.position[1] + dy
+
+                        is_target_agent_occupied = ([target_x, target_y] == self.agent.position)
+                        is_target_map_valid = self._is_valid_position(target_x, target_y)
+                        
+                        can_move_to_target = is_target_map_valid and not is_target_agent_occupied
+                        if can_move_to_target:
+                            if self.enemy.move(0, dy, self.map_width, self.map_height): # move() deducts speed
+                                moved_enemy = True 
+                        
+                        if not can_move_to_target: # Collision with wall OR agent
+                            self.enemy.speed_remaining -= enemy_move_cost
+        
+        # Truncate condition
+        if self.current_episode_steps >= self.max_episode_steps and not terminated:
+            truncated = True
+            reward = 0
 
         return self._get_obs(), reward, terminated, truncated, self._get_info()
 
-    def render(self) -> Optional[str]:
-        if self.render_mode is None: # For gym v26, render_mode can be None
-            gym.logger.warn("Cannot render without specifying a render mode. Using 'ansi'.")
-            self.render_mode = 'ansi'
+    def _render_pygame_frame(self, surface: pygame.Surface):
+        if surface is None: return
 
-        if self.render_mode == 'ansi':
+        surface.fill(self.BACKGROUND_COLOR)
+
+        # Draw Grid
+        for x in range(self.map_width):
+            for y in range(self.map_height):
+                rect = pygame.Rect(x * self.CELL_SIZE, y * self.CELL_SIZE, self.CELL_SIZE, self.CELL_SIZE)
+                pygame.draw.rect(surface, self.GRID_COLOR, rect, 1) # Grid lines
+                # Optional: Draw grid coordinates
+                # coord_text = self.small_font.render(f"{x},{y}", True, self.GRID_COLOR)
+                # surface.blit(coord_text, (rect.x + 2, rect.y + 2))
+
+
+        # Draw Creatures
+        if self.agent.is_alive:
+            agent_rect = pygame.Rect(self.agent.position[0] * self.CELL_SIZE, 
+                                     self.agent.position[1] * self.CELL_SIZE, 
+                                     self.CELL_SIZE, self.CELL_SIZE)
+            pygame.draw.rect(surface, self.AGENT_COLOR, agent_rect)
+            agent_id_text = self.small_font.render("A", True, self.TEXT_COLOR)
+            surface.blit(agent_id_text, (agent_rect.x + self.CELL_SIZE // 2 - agent_id_text.get_width() // 2, 
+                                       agent_rect.y + self.CELL_SIZE // 2 - agent_id_text.get_height() // 2))
+
+
+        if self.enemy.is_alive:
+            enemy_rect = pygame.Rect(self.enemy.position[0] * self.CELL_SIZE, 
+                                     self.enemy.position[1] * self.CELL_SIZE, 
+                                     self.CELL_SIZE, self.CELL_SIZE)
+            pygame.draw.rect(surface, self.ENEMY_COLOR, enemy_rect)
+            enemy_id_text = self.small_font.render("E", True, self.TEXT_COLOR)
+            surface.blit(enemy_id_text, (enemy_rect.x + self.CELL_SIZE // 2 - enemy_id_text.get_width() // 2,
+                                        enemy_rect.y + self.CELL_SIZE // 2 - enemy_id_text.get_height() // 2))
+
+        # Draw Stats Area Background
+        stats_area_y_start = self.map_height * self.CELL_SIZE
+        stats_rect = pygame.Rect(0, stats_area_y_start, 
+                                 self.map_width * self.CELL_SIZE, self.STATS_AREA_HEIGHT)
+        pygame.draw.rect(surface, (30,30,30), stats_rect) # Slightly lighter than background for stats area
+
+        # Draw Stats Text
+        agent_stats_str = (f"Agent: HP {self.agent.current_hp}/{self.agent.max_hp} | "
+                           f"AC {self.agent.ac} | Speed {self.agent.speed_remaining}/{self.agent.speed_total}")
+        enemy_stats_str = (f"Enemy: HP {self.enemy.current_hp}/{self.enemy.max_hp} | "
+                           f"AC {self.enemy.ac} | Speed {self.enemy.speed_remaining}/{self.enemy.speed_total}")
+
+        agent_text_render = self.font.render(agent_stats_str, True, self.TEXT_COLOR)
+        enemy_text_render = self.font.render(enemy_stats_str, True, self.TEXT_COLOR)
+
+        surface.blit(agent_text_render, (10, stats_area_y_start + 10))
+        surface.blit(enemy_text_render, (10, stats_area_y_start + 40))
+        
+        # Optional: Display last action or current turn info
+        # last_action_info = f"Last Action: {self._last_action_string}" # If you store this
+        # last_action_render = self.font.render(last_action_info, True, self.TEXT_COLOR)
+        # surface.blit(last_action_render, (10, stats_area_y_start + 70))
+
+
+    def render(self) -> Optional[Union[np.ndarray, str]]:
+        if self.render_mode is None and 'human' not in self.metadata['render_modes'] and 'rgb_array' not in self.metadata['render_modes']:
+             gym.logger.warn("Cannot render without specifying a render mode and Pygame installed. Using 'ansi'.")
+             # Fallback to ANSI if pygame is not available or modes are not set up.
+             # However, if pygame is None from the start, __init__ would have raised error if human/rgb was selected.
+             self.render_mode = 'ansi' # Default if truly no other option
+
+        if self.render_mode == 'human':
+            if pygame is None or self.screen is None or self.clock is None:
+                # This case should ideally be prevented by __init__ erroring out
+                # or by not allowing 'human' mode if pygame is not available.
+                print("Pygame not initialized for 'human' mode. Cannot render.")
+                return None 
+            
+            self._render_pygame_frame(self.screen)
+            pygame.display.flip()
+            self.clock.tick(self.metadata['render_fps'])
+            
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.close() # This will call pygame.quit()
+                    # To signal the main loop to stop (if run_env.py is the main loop)
+                    # this environment might need a flag like self.running = False
+                    # For now, close() handles pygame shutdown. The outer loop should check termination.
+            return None # Human mode usually returns None
+
+        elif self.render_mode == 'rgb_array':
+            if pygame is None or self.render_surface is None:
+                print("Pygame not initialized for 'rgb_array' mode. Cannot render.")
+                return None
+            
+            self._render_pygame_frame(self.render_surface)
+            # Convert surface to numpy array and transpose for (H, W, C)
+            return np.transpose(pygame.surfarray.array3d(self.render_surface), axes=(1, 0, 2))
+
+        elif self.render_mode == 'ansi':
             grid = [['.' for _ in range(self.map_width)] for _ in range(self.map_height)]
             
-            # Place enemy
             if self.enemy.is_alive and self._is_valid_position(self.enemy.position[0], self.enemy.position[1]):
                 grid[self.enemy.position[1]][self.enemy.position[0]] = 'E'
             
-            # Place agent (overwrites enemy if same spot, though reset tries to avoid this)
             if self.agent.is_alive and self._is_valid_position(self.agent.position[0], self.agent.position[1]):
                 grid[self.agent.position[1]][self.agent.position[0]] = 'A'
 
             ansi_str = "\n".join(" ".join(row) for row in grid)
             ansi_str += (f"\nAgent HP: {self.agent.current_hp}/{self.agent.max_hp}, Speed: {self.agent.speed_remaining}/{self.agent.speed_total} "
                          f"| Enemy HP: {self.enemy.current_hp}/{self.enemy.max_hp}")
-            print(ansi_str)
-            return ansi_str
+            print(ansi_str) # ANSI mode prints to console
+            return ansi_str # And also returns the string for gym compliance
+        
         else:
-            return None # Or raise error for unsupported modes
+            # Should not happen if render_mode is validated in __init__ or here
+            raise ValueError(f"Unsupported render mode: {self.render_mode}")
+
 
     def close(self):
-        # Clean up any resources if needed
-        pass
+        if self.render_mode == 'human' and pygame is not None and self.screen is not None:
+            try:
+                pygame.display.quit()
+                pygame.quit()
+                self.screen = None # Mark as closed
+            except Exception as e:
+                print(f"Error during pygame shutdown: {e}")
+        # No specific cleanup needed for rgb_array surface beyond normal GC
+        # No specific cleanup for ansi
 
 if __name__ == '__main__':
     # Example Usage (requires dice.py in the same directory or PYTHONPATH)
@@ -404,7 +626,8 @@ if __name__ == '__main__':
 
     env = DnDCombatEnv(map_width=10, map_height=10, 
                        agent_stats=agent_example_stats, 
-                       enemy_stats=enemy_example_stats)
+                        enemy_stats=enemy_example_stats,
+                        render_mode='human') # Example with human rendering
 
     obs, info = env.reset()
     print("Initial Observation:", obs)
@@ -412,25 +635,32 @@ if __name__ == '__main__':
     env.render()
 
     # Example: Agent tries to attack enemy (action index for first attack is 4: N,S,E,W, Attack0)
-    # Find the sword attack index:
-    sword_attack_action_idx = -1
+    # Find the sword attack index: (Now 'club' for commoner if using bestiary stats)
+    # For the __main__ example, let's use the generic first attack.
+    first_attack_action_idx = -1
     for i, action_def in enumerate(env.action_map):
-        if action_def["type"] == "attack" and action_def["name"] == "attack_sword":
-            sword_attack_action_idx = i
+        if action_def["type"] == "attack":
+            first_attack_action_idx = i
+            print(f"Found first attack: {action_def['name']} at index {i}")
             break
     
-    if sword_attack_action_idx != -1:
-        print(f"\nTaking action: Attack with Sword (action index {sword_attack_action_idx})")
-        obs, reward, terminated, truncated, info = env.step(sword_attack_action_idx)
+    if first_attack_action_idx != -1:
+        print(f"\nTaking action: {env.action_map[first_attack_action_idx]['name']} (action index {first_attack_action_idx})")
+        obs, reward, terminated, truncated, info = env.step(first_attack_action_idx)
         print("Observation after attack:", obs)
         print("Reward:", reward)
         print("Terminated:", terminated)
         print("Info:", info)
-        env.render()
-    else:
-        print("Could not find sword attack action for example.")
+        if env.render_mode == 'human': # Only render if human mode
+            env.render()
+            pygame.time.wait(1000) # Pause to see result
+        elif env.render_mode == 'ansi':
+            env.render()
 
-    # Example: Agent tries to move East (action index 2)
+    else:
+        print("Could not find any attack action for example.")
+
+    # Example: Agent tries to move East
     move_east_action_idx = -1
     for i, action_def in enumerate(env.action_map):
         if action_def["type"] == "move" and action_def["name"] == "move_E":
@@ -438,11 +668,18 @@ if __name__ == '__main__':
             break
     if move_east_action_idx != -1:
         print(f"\nTaking action: Move East (action index {move_east_action_idx})")
-        obs, reward, terminated, truncated, info = env.step(move_east_action_idx) # Move East
+        obs, reward, terminated, truncated, info = env.step(move_east_action_idx)
         print("Observation after move:", obs)
         print("Reward:", reward)
         print("Terminated:", terminated)
         print("Info:", info)
-        env.render()
+        if env.render_mode == 'human': # Only render if human mode
+             env.render()
+             pygame.time.wait(1000) # Pause to see result
+        elif env.render_mode == 'ansi':
+            env.render()
     else:
         print("Could not find move East action for example.")
+    
+    if env.render_mode == 'human':
+        env.close() # Important to close pygame window

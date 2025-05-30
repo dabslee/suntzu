@@ -1,6 +1,8 @@
 import sys
 from dnd_gym_env import DnDCombatEnv # Assuming dnd_gym_env.py is in the same directory or PYTHONPATH
 from gymnasium.utils.env_checker import check_env
+from bestiary.commoner import get_commoner_stats
+from bestiary.wolf import get_wolf_stats
 
 def run():
     """
@@ -8,33 +10,19 @@ def run():
     """
     print("Initializing D&D Combat Environment...")
 
-    agent_stats = {
-        "ac": 15,
-        "max_hp": 50,
-        "speed_total": 6, # cells
-        "attacks": [
-            {"name": "longsword", "to_hit": 5, "damage_dice": "1d8+3", "num_attacks": 1},
-            {"name": "shortbow", "to_hit": 4, "damage_dice": "1d6+2", "num_attacks": 1}
-        ],
-        "bonus_actions": ["bonus_move_1_cell"]
-        # initial_position is handled by the environment's reset method
-    }
-
-    enemy_stats = {
-        "ac": 13,
-        "max_hp": 30,
-        "speed_total": 5, # cells
-        "attacks": [
-            {"name": "scimitar", "to_hit": 4, "damage_dice": "1d6+2", "num_attacks": 1}
-        ],
-        "bonus_actions": []
-        # initial_position is handled by the environment's reset method
-    }
+    agent_stats = get_commoner_stats()
+    enemy_stats = get_wolf_stats()
+    
+    # Optionally, print the stats to verify they are loaded
+    # print(f"Agent (Commoner) Stats: {agent_stats}")
+    # print(f"Enemy (Wolf) Stats: {enemy_stats}")
 
     try:
+        # Instantiate with human rendering mode
         env = DnDCombatEnv(map_width=10, map_height=10, 
                            agent_stats=agent_stats, 
-                           enemy_stats=enemy_stats)
+                           enemy_stats=enemy_stats,
+                           render_mode='human')
     except Exception as e:
         print(f"Error during environment instantiation: {e}")
         print("Please ensure dice.py is accessible and correct.")
@@ -138,7 +126,7 @@ if __name__ == '__main__':
     # For example, if run_env.py is in the same directory as them:
     # import os
     # script_dir = os.path.dirname(os.path.abspath(__file__))
-    # sys.path.insert(0, script_dir)
+    # sys.path.insert(0, script_dir) # This line is commented out as it's usually not needed if structure is flat or using PYTHONPATH
     
     # This simple structure assumes that Python's import mechanism can find
     # dnd_gym_env (and by extension, dice). This is true if:
