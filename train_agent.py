@@ -85,73 +85,81 @@ if __name__ == "__main__":
     print("Model saved.")
 
     # --- Evaluation ---
-    print("Starting evaluation...")
-    # Create a new vectorized environment for evaluation for consistency
-    eval_vec_env = DummyVecEnv([lambda: FlattenObservation(make_env())])
-
-    mean_reward, std_reward = evaluate_policy(
-        model, 
-        eval_vec_env, 
-        n_eval_episodes=100, 
-        deterministic=True, 
-        warn=False # Suppress warnings during evaluation
-    )
-    print(f"Evaluation using SB3 evaluate_policy: Mean reward: {mean_reward:.2f} +/- {std_reward:.2f}")
-
-    # Manual evaluation loop for custom metrics like win rate
-    num_eval_episodes = 100
-    total_rewards_manual = 0
-    wins = 0
-    draws = 0
-    print("DEBUG: About to load model...")
-    loaded_model = DQN.load(MODEL_SAVE_PATH)
-    print("DEBUG: Model loaded successfully.")
-    
-    print("DEBUG: About to create raw manual eval env...")
+    print("Starting evaluation with manual loop...")
+    # Create a new environment for evaluation - non-vectorized, but wrapped
     manual_eval_env_raw = make_env()
-    print("DEBUG: Raw manual eval env created.")
+    eval_env_wrapped = wrap_env(manual_eval_env_raw) # wrap_env uses FlattenObservation
 
-    print("DEBUG: About to wrap manual eval env...")
-    manual_eval_env_wrapped = wrap_env(manual_eval_env_raw) # wrap_env is FlattenObservation
-    print("DEBUG: Manual eval env wrapped.")
+    # Load the model
+    loaded_model = DQN.load(MODEL_SAVE_PATH)
 
-    print(f"Starting manual evaluation for {num_eval_episodes} episodes for win rate...") # You see this line
+    num_eval_episodes = 20 
+    total_rewards_manual = 0 # Renamed for clarity, matching original commented out code
+    wins = 0
+    losses = 0
+    draws = 0
+    
+    print(f"\nStarting manual evaluation for {num_eval_episodes} episodes (max steps per episode: {manual_eval_env_raw.max_episode_steps})...")
 
     for episode in range(num_eval_episodes):
-        # It's good practice to have the episode start print here:
-        # print(f"--- Starting evaluation episode {episode + 1}/{num_eval_episodes} ---") 
-        # print(f"DEBUG: Episode {episode + 1}: About to reset env...")
-        obs, info = manual_eval_env_wrapped.reset()
-        # print(f"DEBUG: Episode {episode + 1}: Env reset successfully.")
-
+        print(f"--- Starting evaluation episode {episode + 1}/{num_eval_episodes} ---")
+        obs, info = eval_env_wrapped.reset()
+        
+        # These flags are from the last step of an episode
+        # Initialize them before the loop for clarity, will be updated by step()
+        terminated = False 
+        truncated = False
         done = False
         episode_reward = 0
+        episode_steps = 0 
+
         while not done:
             action, _states = loaded_model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = manual_eval_env_wrapped.step(action)
+            # Store the flags from the step
+            obs, reward, terminated, truncated, info = eval_env_wrapped.step(action) 
+            
+            episode_steps = manual_eval_env_raw.current_episode_steps 
+            
             done = terminated or truncated
             episode_reward += reward
         
-        # Access the raw environment to check win condition
-        if manual_eval_env_raw.agent.is_alive and not manual_eval_env_raw.enemy.is_alive:
-            wins += 1
-        if manual_eval_env_raw.agent.is_alive and manual_eval_env_raw.enemy.is_alive:
-            draws += 1
         total_rewards_manual += episode_reward
-        print(f"Manual Eval - Episode {episode + 1}: Reward = {episode_reward:.2f}, Agent HP = {manual_eval_env_raw.agent.current_hp}, Enemy HP = {manual_eval_env_raw.enemy.current_hp}, Agent Alive: {manual_eval_env_raw.agent.is_alive}, Enemy Alive: {not manual_eval_env_raw.enemy.is_alive}")
+        print(f"Episode {episode + 1} finished after {episode_steps} steps. Reward: {episode_reward:.2f}")
 
+        # Check episode outcome using the 'terminated' and 'truncated' flags from the last step
+        if truncated and not terminated: # Check for truncation first
+            draws += 1
+            print(f"Result: Draw (reached max {manual_eval_env_raw.max_episode_steps} steps). Agent HP: {manual_eval_env_raw.agent.current_hp}, Enemy HP: {manual_eval_env_raw.enemy.current_hp}")
+        elif terminated: # If not a draw by truncation, check for termination by game rules
+            if manual_eval_env_raw.agent.is_alive and not manual_eval_env_raw.enemy.is_alive:
+                wins += 1
+                print(f"Result: Agent Won. Agent HP: {manual_eval_env_raw.agent.current_hp}, Enemy HP: {manual_eval_env_raw.enemy.current_hp}")
+            elif not manual_eval_env_raw.agent.is_alive: 
+                losses += 1
+                print(f"Result: Agent Lost. Agent HP: {manual_eval_env_raw.agent.current_hp}, Enemy HP: {manual_eval_env_raw.enemy.current_hp}")
+            else: # Terminated, but agent is alive AND enemy is alive (or both dead - less likely scenario)
+                  # This case could be a special draw or an unexpected termination.
+                draws +=1 # Counting as a draw for now if not a clear win/loss upon termination
+                print(f"Result: Undetermined (Terminated but not clear win/loss by HP - counted as draw). Agent HP: {manual_eval_env_raw.agent.current_hp}, Enemy HP: {manual_eval_env_raw.enemy.current_hp}")
+        # No 'else' needed here, as 'done' must be True for the loop to exit.
 
-    avg_reward_manual = total_rewards_manual / num_eval_episodes
-    win_rate = wins / num_eval_episodes
-    draw_rate = draws / num_eval_episodes
-    print(f"Manual Evaluation Complete: Average Reward = {avg_reward_manual:.2f}, Win Rate = {win_rate:.2%}, Draw Rate = {draw_rate:.2%}")
+    avg_reward_manual = total_rewards_manual / num_eval_episodes if num_eval_episodes > 0 else 0
+    win_rate = wins / num_eval_episodes if num_eval_episodes > 0 else 0
+    loss_rate = losses / num_eval_episodes if num_eval_episodes > 0 else 0
+    draw_rate = draws / num_eval_episodes if num_eval_episodes > 0 else 0
+
+    print(f"\n--- Manual Evaluation Summary ---")
+    print(f"Total Episodes: {num_eval_episodes}")
+    print(f"Average Reward: {avg_reward_manual:.2f}")
+    print(f"Wins: {wins} ({win_rate:.2%})")
+    print(f"Losses: {losses} ({loss_rate:.2%})")
+    print(f"Draws (includes max steps and other terminated draws): {draws} ({draw_rate:.2%})")
+    print("------------------------------------")
 
     print("\nTo view tensorboard logs, run the following command in your terminal:")
     print(f"tensorboard --logdir=\"{os.path.abspath(LOG_DIR)}\"")
     print("\nTraining and evaluation script example complete.")
 
     # --- Cleanup ---
-    vec_env.close()
-    eval_vec_env.close()
-    manual_eval_env_wrapped.close() # This will call close on manual_eval_env_raw too if properly chained.
-                                 # Or call manual_eval_env_raw.close() explicitly if needed.
+    vec_env.close() # This is the training env
+    eval_env_wrapped.close() # Close the evaluation environment

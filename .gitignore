@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+*.venv/
+*.venv
+
+# IDEs
+.idea/
+.vscode/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.swp
+
+# Model and Log files
+*.zip
+*tensorboard*/
+*.pt
+
+# Environment variables
+.env
+
+# Other
+dnd_dqn_tensorboard/ # Specific log dir from train_agent.py, covered by *tensorboard*/ but explicit is fine
+dnd_dqn_agent.zip # Specific model file from train_agent.py, covered by *.zip but explicit is fine

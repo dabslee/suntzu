@@ -1,136 +1,143 @@
 import sys
-from dnd_gym_env import DnDCombatEnv # Assuming dnd_gym_env.py is in the same directory or PYTHONPATH
+import os
+import argparse
+from stable_baselines3 import DQN
+from gymnasium.wrappers import FlattenObservation
 from gymnasium.utils.env_checker import check_env
+
+from dnd_gym_env import DnDCombatEnv 
 from bestiary.commoner import get_commoner_stats
 from bestiary.wolf import get_wolf_stats
 
-def run():
+MODEL_PATH = "dnd_dqn_agent.zip" # Path to the saved model
+
+def main(AGENT_TYPE):
     """
-    Runs the D&D Combat Environment with basic checks and interaction.
+    Runs the D&D Combat Environment with specified agent type.
     """
-    print("Initializing D&D Combat Environment...")
+    print(f"Initializing D&D Combat Environment with {AGENT_TYPE} agent...")
 
     agent_stats = get_commoner_stats()
     enemy_stats = get_wolf_stats()
-    
-    # Optionally, print the stats to verify they are loaded
-    # print(f"Agent (Commoner) Stats: {agent_stats}")
-    # print(f"Enemy (Wolf) Stats: {enemy_stats}")
 
-    try:
-        # Instantiate with human rendering mode
-        env = DnDCombatEnv(map_width=10, map_height=10, 
-                           agent_stats=agent_stats, 
-                           enemy_stats=enemy_stats,
-                           render_mode='human')
-    except Exception as e:
-        print(f"Error during environment instantiation: {e}")
-        print("Please ensure dice.py is accessible and correct.")
-        return
-
+    # Create the raw environment - this instance will be used throughout.
+    env = DnDCombatEnv(
+        map_width=10, map_height=10,
+        agent_stats=agent_stats, enemy_stats=enemy_stats,
+        render_mode='human' 
+    )
     print("Environment instantiated.")
 
-    # Run Environment Checker
+    # Run Environment Checker on the raw environment
     try:
         print("\nRunning Environment Checker...")
-        # Use env.unwrapped to get the core environment if it's wrapped (e.g. by TimeLimit)
-        # For a custom env not yet wrapped, env itself is fine.
-        # However, check_env often expects the unwrapped version.
-        check_env(env.unwrapped) # No-op if not wrapped, else gets the base env.
+        check_env(env) 
         print("Environment check passed successfully!")
     except Exception as e:
         print(f"Environment check failed: {e}")
-        print("There might be issues with the environment's adherence to the Gymnasium API.")
-        # It might be useful to proceed with the interaction loop anyway for debugging,
-        # or exit if strict compliance is required first.
-        # For now, let's proceed.
+        env.close()
+        return
+    print("Render mode: ", env.render_mode)
 
-    # Basic Interaction Loop
-    print("\nStarting basic interaction loop...")
+    model = None
+    flatten_wrapper = None # Will wrap 'env' if using a trained agent
+
+    if AGENT_TYPE == "trained":
+        if not os.path.exists(MODEL_PATH):
+            print(f"Warning: Model file not found at {MODEL_PATH}. Falling back to random agent.")
+            AGENT_TYPE = "random" # Fallback
+        else:
+            print(f"Loading trained model from {MODEL_PATH}...")
+            try:
+                model = DQN.load(MODEL_PATH)
+                print("Model loaded.")
+                # The flatten_wrapper should wrap the *same instance* of env that is used in the loop
+                flatten_wrapper = FlattenObservation(env)
+            except Exception as e:
+                print(f"Error loading model: {e}. Falling back to random agent.")
+                AGENT_TYPE = "random"
+                model = None # Ensure model is None if loading failed
+
+    print(f"\nStarting interaction loop with {AGENT_TYPE} agent...")
     try:
-        obs, info = env.reset(seed=42) # Using a seed for reproducibility
+        # Reset the raw environment. The observation is a dict.
+        obs_dict, info = env.reset(seed=42) 
     except Exception as e:
         print(f"Error during env.reset(): {e}")
+        env.close()
         return
         
-    print("Initial state rendered:")
-    env.render()
-    print(f"Initial Observation: {obs}")
-    print(f"Initial Info: {info}")
+    env.render() # Initial render
 
-    max_steps = 30
-    for step_num in range(max_steps):
+    max_run_steps = 150 # Increased steps for potentially longer trained agent episodes
+    for step_num in range(max_run_steps):
         print(f"\n--- Step {step_num + 1} ---")
 
-        if not env.agent.is_alive and not env.enemy.is_alive:
-            print("Both agent and enemy are not alive. This might be an unexpected state.")
-            break
-        if not env.agent.is_alive:
-            print("Agent is no longer alive.")
-            # Loop might continue to see enemy actions or until termination condition is met
-            # For now this is fine, termination should handle it.
+        action = None
+        action_desc_str = "N/A"
 
-        action = env.action_space.sample()
+        if AGENT_TYPE == "trained" and model and flatten_wrapper:
+            try:
+                # Flatten the dictionary observation for the model
+                flat_obs_for_model = flatten_wrapper.observation(obs_dict)
+                action, _ = model.predict(flat_obs_for_model, deterministic=True)
+                action_desc_str = f"Trained Agent Action (Index {action}): {env._decode_action(action).get('name', 'Unknown')}"
+            except Exception as e:
+                print(f"Error during model prediction: {e}. Using random action instead.")
+                AGENT_TYPE = "random" # Fallback for this step
         
-        # Get action description for printing
-        try:
-            action_desc = env.action_map[action] # Accessing through property
-            print(f"Chosen Action (Index {action}): {action_desc.get('name', 'Unknown Action Name')} ({action_desc['type']})")
-        except IndexError:
-            print(f"Chosen Action (Index {action}): Invalid action index!")
-            action_desc = {"type": "invalid", "name": "invalid"}
+        if AGENT_TYPE == "random": # Also handles fallback
+            action = env.action_space.sample()
+            action_desc_str = f"Random Agent Action (Index {action}): {env._decode_action(action).get('name', 'Unknown')}"
+        
+        print(action_desc_str)
 
+        if action is None: # Should not happen if logic is correct
+            print("Error: No action determined. Breaking loop.")
+            break
 
         try:
-            obs, reward, terminated, truncated, info = env.step(action)
+            obs_dict, reward, terminated, truncated, info = env.step(action)
         except Exception as e:
-            print(f"Error during env.step() with action {action} ({action_desc}): {e}")
-            # Depending on the error, you might want to break or try to recover.
-            # For a simple run script, printing and breaking is often best.
+            print(f"Error during env.step() with action {action}: {e}")
             import traceback
             traceback.print_exc()
             break
             
-        print("\nEnvironment rendered after action:")
         env.render()
         
-        print(f"Observation: {obs}")
-        print(f"Reward: {reward}")
-        print(f"Terminated: {terminated}")
-        print(f"Truncated: {truncated}") # Should usually be False for this env
-        print(f"Info: {info}")
+        print(f"Reward: {reward:.2f}, Terminated: {terminated}, Truncated: {truncated}")
+        print(f"Agent HP: {env.agent.current_hp}, Enemy HP: {env.enemy.current_hp}")
+        print(f"Agent Pos: {env.agent.position}, Enemy Pos: {env.enemy.position}")
+        print(f"Steps taken in episode: {env.current_episode_steps}")
+
 
         if terminated or truncated:
-            print("\nGame Over!")
+            print("\nEpisode finished!")
             if terminated:
-                if not env.agent.is_alive: print("Agent was defeated.")
-                elif not env.enemy.is_alive: print("Enemy was defeated. Agent wins!")
-                else: print("Terminated for other reasons.")
+                if env.agent.is_alive and not env.enemy.is_alive: print("Result: Agent Won!")
+                elif not env.agent.is_alive: print("Result: Agent Lost!")
+                else: print("Result: Terminated for other reasons.")
             if truncated:
-                print("Episode truncated (e.g., time limit reached).")
-            break
+                print(f"Result: Draw (reached max {env.max_episode_steps} steps).")
+            
+            # Option to run more episodes or break
+            # For now, break after one episode in this script's run
+            break 
     
-    if step_num == max_steps - 1 and not (terminated or truncated):
-        print(f"\nReached max steps ({max_steps}) without termination.")
+    if step_num == max_run_steps - 1 and not (terminated or truncated):
+        print(f"\nReached max run steps ({max_run_steps}) for this interaction without termination/truncation.")
 
-    # Close the environment
-    try:
-        env.close()
-        print("\nEnvironment closed.")
-    except Exception as e:
-        print(f"Error during env.close(): {e}")
+    env.close()
+    print("\nEnvironment closed.")
 
 if __name__ == '__main__':
-    # Add the directory containing dnd_gym_env.py and dice.py to sys.path
-    # if they are not already discoverable via PYTHONPATH
-    # For example, if run_env.py is in the same directory as them:
-    # import os
-    # script_dir = os.path.dirname(os.path.abspath(__file__))
-    # sys.path.insert(0, script_dir) # This line is commented out as it's usually not needed if structure is flat or using PYTHONPATH
+    parser = argparse.ArgumentParser(description="Run D&D Combat Environment with a random or trained agent.")
+    parser.add_argument("--agent", type=str, default="random", choices=["random", "trained"],
+                        help="Type of agent to run (random or trained). Default: random")
+    args = parser.parse_args()
     
-    # This simple structure assumes that Python's import mechanism can find
-    # dnd_gym_env (and by extension, dice). This is true if:
-    # 1. They are in the same directory as run_env.py and run_env.py is run from that directory.
-    # 2. The directory containing them is in PYTHONPATH.
-    # 3. They are installed as part of a package.
-    run()
+    # Assuming dnd_gym_env.py, bestiary/*, and dice.py are structured to be found.
+    # If run_env.py is in the root, and dnd_gym_env is in root, and bestiary is a dir in root:
+    # no special sys.path manipulation should be needed if running from root.
+    main(AGENT_TYPE="trained")

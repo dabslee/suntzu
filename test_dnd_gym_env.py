@@ -181,9 +181,11 @@ def enemy_stats_env():
 
 @pytest.fixture
 def dnd_env(agent_stats_env, enemy_stats_env):
+    # Default to ansi mode for most tests to avoid Pygame initialization issues in CI
     return DnDCombatEnv(map_width=10, map_height=10, 
                         agent_stats=agent_stats_env, 
-                        enemy_stats=enemy_stats_env)
+                        enemy_stats=enemy_stats_env,
+                        render_mode='ansi')
 
 def test_env_initialization(dnd_env, agent_stats_env, enemy_stats_env):
     assert dnd_env.agent is not None
@@ -624,3 +626,56 @@ def test_rendering_ansi(dnd_env): # dnd_env fixture has render_mode=None by defa
 
     except Exception as e:
         pytest.fail(f"env.render() raised an exception: {e}")
+
+
+def test_episode_truncation(dnd_env): # Uses the dnd_env fixture
+    env = dnd_env 
+    obs, info = env.reset(seed=12) # Use a seed for reproducibility
+    assert env.current_episode_steps == 0, "current_episode_steps should be 0 after reset"
+
+    # Determine a pass action.
+    pass_action_idx = -1
+    for i, action_def in enumerate(env.action_map):
+        if action_def.get("name") == "pass_turn": # Assuming name is "pass_turn"
+            pass_action_idx = i
+            break
+    if pass_action_idx == -1:
+        pytest.fail("Could not determine 'pass_turn' action from env.action_map.")
+
+    terminated = False
+    truncated = False # Variable to store truncated from last step
+    
+    # Loop up to one step before max_episode_steps
+    # env.max_episode_steps should be 100 as per DnDCombatEnv.__init__
+    for step_num_one_based in range(1, env.max_episode_steps): 
+        assert env.current_episode_steps == step_num_one_based - 1, \
+            f"Step count mismatch before step {step_num_one_based}. Expected {step_num_one_based - 1}, got {env.current_episode_steps}"
+        
+        # Store the flags from the step call
+        obs, reward, terminated_step, truncated_step, info = env.step(pass_action_idx)
+        terminated = terminated_step # Update loop control based on this step
+        truncated = truncated_step   # Update loop control based on this step
+        
+        assert env.current_episode_steps == step_num_one_based, \
+            f"Step count mismatch after step {step_num_one_based}. Expected {step_num_one_based}, got {env.current_episode_steps}"
+        assert not terminated, \
+            f"Episode should not terminate at step {step_num_one_based} ({env.current_episode_steps}/{env.max_episode_steps}) with only pass actions"
+        assert not truncated, \
+            f"Episode should not truncate at step {step_num_one_based} ({env.current_episode_steps}/{env.max_episode_steps}) with only pass actions"
+
+    # On the max_episode_steps-th step (this is the step that should cause truncation)
+    assert env.current_episode_steps == env.max_episode_steps - 1, \
+        f"Should be at step {env.max_episode_steps -1} before the truncating step. Got {env.current_episode_steps}"
+    
+    obs, reward, terminated_step, truncated_step, info = env.step(pass_action_idx)
+    terminated = terminated_step
+    truncated = truncated_step
+    
+    assert env.current_episode_steps == env.max_episode_steps, \
+        f"Step count should be {env.max_episode_steps} at truncation. Got {env.current_episode_steps}"
+    assert not terminated, "Episode should not be 'terminated' on max_steps if only pass actions lead to truncation"
+    assert truncated is True, "Episode should be 'truncated' on max_steps"
+    
+    # Check if current_episode_steps resets after truncation
+    obs, info = env.reset(seed=13) # Use a different seed for reset
+    assert env.current_episode_steps == 0, "current_episode_steps should be 0 after reset following a truncated episode"

@@ -124,13 +124,15 @@ class DnDCombatEnv(gym.Env):
         self.map_height = map_height
         self.grid_size = grid_size # Feet per grid cell. Assume creature speeds are in cells for now.
         
+        self.max_episode_steps = 100 # Max steps per episode
+        self.current_episode_steps = 0 # Current step in the episode
+
         self.render_mode = render_mode
         self.screen = None
         self.clock = None
         self.font = None
         self.render_surface = None # For rgb_array
         self.window_surface = None # Surface to draw on (screen or render_surface)
-        self.max_episode_steps = 100
         
         self.CELL_SIZE = 50
         self.STATS_AREA_HEIGHT = 100
@@ -243,7 +245,6 @@ class DnDCombatEnv(gym.Env):
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         super().reset(seed=seed)
-        self.current_episode_steps = 0
 
         # Randomly place agent and enemy, ensuring no overlap
         while True:
@@ -258,6 +259,7 @@ class DnDCombatEnv(gym.Env):
         
         # Reset turn-specific states (e.g. if bonus actions were once per turn)
         # self.bonus_action_used_this_turn = False 
+        self.current_episode_steps = 0 # Reset step counter for the new episode
 
         return self._get_obs(), self._get_info()
 
@@ -277,7 +279,8 @@ class DnDCombatEnv(gym.Env):
         return self.action_map[action_int]
 
     def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
-        self.current_episode_steps += 1
+        self.current_episode_steps += 1 # Increment step counter
+
         terminated = False
         truncated = False 
         reward = -0.1  # Overall step penalty
@@ -367,11 +370,8 @@ class DnDCombatEnv(gym.Env):
                 action_taken_successfully = True # Passing is a valid choice
                 pass
 
-            if not action_taken_successfully:
-                # No additional penalty here beyond the initial -0.1 step penalty.
-                pass
-            
             # Agent survival reward for this turn (if action didn't end episode)
+            # (The 'if not action_taken_successfully: pass' block was removed as it was neutral)
             if self.agent.is_alive and not terminated:
                 reward += 0.5
 
@@ -466,11 +466,11 @@ class DnDCombatEnv(gym.Env):
                         
                         if not can_move_to_target: # Collision with wall OR agent
                             self.enemy.speed_remaining -= enemy_move_cost
-        
-        # Truncate condition
-        if self.current_episode_steps >= self.max_episode_steps and not terminated:
+
+        # Check for truncation due to max steps
+        if not terminated and self.current_episode_steps >= self.max_episode_steps:
             truncated = True
-            reward = 0
+            # Reward for truncation is neutral; step penalty and survival (if applicable) already applied.
 
         return self._get_obs(), reward, terminated, truncated, self._get_info()
 
