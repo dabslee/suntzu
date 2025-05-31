@@ -3,12 +3,26 @@ import random
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
+import os 
 
 # Pygame import (optional)
 try:
     import pygame
 except ImportError:
     pygame = None # Flag to indicate Pygame is not available
+
+# SB3 and FlattenObservation imports (optional)
+try:
+    from stable_baselines3 import DQN
+    from gymnasium.wrappers import FlattenObservation
+    SB3_AVAILABLE = True
+except ImportError:
+    SB3_AVAILABLE = False
+    # Define dummy classes if SB3 not available for type hints and class structure
+    class DQN: pass 
+    class FlattenObservation: pass
+    print("Warning: stable-baselines3 or gymnasium.wrappers not found. DRL agent functionality will be limited.")
+
 
 # Assuming dice.py is in the same directory or PYTHONPATH
 try:
@@ -117,17 +131,31 @@ class Creature:
 class DnDCombatEnv(gym.Env):
     metadata = {'render_modes': ['ansi', 'human', 'rgb_array'], 'render_fps': 4}
 
-    def __init__(self, map_width: int, map_height: int, agent_stats: dict, enemy_stats: dict, grid_size: int = 1, render_mode: Optional[str] = None):
+    def __init__(self, 
+                 map_width: int, 
+                 map_height: int, 
+                 agent_stats: dict, 
+                 enemy_stats: dict, 
+                 grid_size: int = 1, 
+                 render_mode: Optional[str] = None, 
+                 export_frames_path: Optional[str] = None,
+                 enemy_model_path: Optional[str] = None): # New parameter
         super().__init__()
 
         self.map_width = map_width
         self.map_height = map_height
-        self.grid_size = grid_size # Feet per grid cell. Assume creature speeds are in cells for now.
+        self.grid_size = grid_size 
         
-        self.max_episode_steps = 100 # Max steps per episode
-        self.current_episode_steps = 0 # Current step in the episode
+        self.max_episode_steps = 100 
+        self.current_episode_steps = 0 
+        self.current_episode_num = 0 
 
         self.render_mode = render_mode
+        self.export_frames_path = export_frames_path
+        
+        if self.export_frames_path:
+            os.makedirs(self.export_frames_path, exist_ok=True)
+            
         self.screen = None
         self.clock = None
         self.font = None
@@ -165,14 +193,57 @@ class DnDCombatEnv(gym.Env):
 
 
         # Ensure 'initial_position' is not passed directly if it's part of agent_stats to avoid TypeError
-        # The actual initial position will be set in reset()
-        agent_stats_copy = agent_stats.copy()
-        agent_stats_copy.pop('initial_position', None) 
-        self.agent = Creature(name="agent", initial_position=[0,0], **agent_stats_copy)
+        # Store stat templates BEFORE creating dummy env for flattener
+        self.agent_stats_template = agent_stats.copy()
+        self.enemy_stats_template = enemy_stats.copy()
+        
+        # Enemy model attributes
+        self.enemy_model_path = enemy_model_path
+        self.enemy_model = None
+        self.enemy_is_model_controlled = False
+        self.enemy_obs_flattener = None
 
-        enemy_stats_copy = enemy_stats.copy()
-        enemy_stats_copy.pop('initial_position', None)
-        self.enemy = Creature(name="enemy", initial_position=[0,0], **enemy_stats_copy)
+        if self.enemy_model_path and SB3_AVAILABLE:
+            if os.path.exists(self.enemy_model_path):
+                print(f"Attempting to load enemy model from: {self.enemy_model_path}")
+                try:
+                    # Important: Pass device='auto' or 'cpu' if running in CPU-only environment
+                    self.enemy_model = DQN.load(self.enemy_model_path, device='auto') 
+                    self.enemy_is_model_controlled = True
+                    
+                    print("Creating dummy environment for enemy observation flattener...")
+                    # Enemy sees itself as 'agent' and current agent as 'enemy'
+                    # This dummy env is only for observation flattening structure, not for running steps.
+                    dummy_env_for_flattener = DnDCombatEnv(
+                        map_width=self.map_width, 
+                        map_height=self.map_height, 
+                        agent_stats=self.enemy_stats_template,  # Enemy is the 'agent' in its own model
+                        enemy_stats=self.agent_stats_template,  # Main agent is the 'enemy' from enemy model's POV
+                        grid_size=self.grid_size,
+                        render_mode=None, # No rendering for this dummy env
+                        export_frames_path=None, # No frame export
+                        enemy_model_path=None # CRITICAL: No recursive model loading
+                    )
+                    self.enemy_obs_flattener = FlattenObservation(dummy_env_for_flattener)
+                    print("Enemy model loaded and flattener created successfully.")
+                except Exception as e:
+                    print(f"Error loading enemy model from {self.enemy_model_path}: {e}. Enemy will use rule-based AI.")
+                    self.enemy_model = None 
+                    self.enemy_is_model_controlled = False
+            else:
+                print(f"Warning: Enemy model path not found: {self.enemy_model_path}. Enemy will use rule-based AI.")
+        elif self.enemy_model_path and not SB3_AVAILABLE:
+            print("Warning: Stable Baselines3 not available. Cannot load enemy model. Enemy will use rule-based AI.")
+
+        # The actual initial position will be set in reset()
+        # Use the stored templates for creating the actual agent and enemy instances
+        agent_init_stats = self.agent_stats_template.copy()
+        agent_init_stats.pop('initial_position', None) 
+        self.agent = Creature(name="agent", initial_position=[0,0], **agent_init_stats)
+
+        enemy_init_stats = self.enemy_stats_template.copy()
+        enemy_init_stats.pop('initial_position', None)
+        self.enemy = Creature(name="enemy", initial_position=[0,0], **enemy_init_stats)
         
         self.dice_roller = roll
 
@@ -243,6 +314,38 @@ class DnDCombatEnv(gym.Env):
             "distance": self._calculate_manhattan_distance(self.agent.position, self.enemy.position)
         }
 
+    def _get_enemy_observation(self) -> Dict[str, Any]:
+        # From enemy's perspective:
+        # 'agent' is the enemy itself, 'enemy' is the current agent.
+
+        # Normalize HP
+        # Enemy's HP (becomes 'agent_hp_norm' for its model)
+        enemy_self_hp_norm = self.enemy.current_hp / self.enemy.max_hp if self.enemy.max_hp > 0 else 0.0
+        # Current agent's HP (becomes 'enemy_hp_norm' for enemy's model)
+        current_agent_hp_norm = self.agent.current_hp / self.agent.max_hp if self.agent.max_hp > 0 else 0.0
+        
+        # Normalize speed for the enemy (becomes 'agent_speed_remaining_norm')
+        # Ensure speed_total is not zero to avoid division by zero, and clamp at 1.0
+        raw_enemy_speed_norm = self.enemy.speed_remaining / self.enemy.speed_total if self.enemy.speed_total > 0 else 0.0
+        enemy_self_speed_norm = min(1.0, raw_enemy_speed_norm)
+
+
+        obs = {
+            # Perspective shift:
+            "agent_hp_norm": np.array([enemy_self_hp_norm], dtype=np.float32),
+            "enemy_hp_norm": np.array([current_agent_hp_norm], dtype=np.float32),
+            
+            "agent_pos": np.array(self.enemy.position, dtype=np.int32), # Enemy's own position
+            "enemy_pos": np.array(self.agent.position, dtype=np.int32),   # Current agent's position
+            
+            # Distance is symmetrical
+            "distance_to_enemy": np.array([self._calculate_manhattan_distance(self.enemy.position, self.agent.position)], dtype=np.float32),
+            
+            # Enemy's speed
+            "agent_speed_remaining_norm": np.array([enemy_self_speed_norm], dtype=np.float32),
+        }
+        return obs
+
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         super().reset(seed=seed)
 
@@ -260,6 +363,7 @@ class DnDCombatEnv(gym.Env):
         # Reset turn-specific states (e.g. if bonus actions were once per turn)
         # self.bonus_action_used_this_turn = False 
         self.current_episode_steps = 0 # Reset step counter for the new episode
+        self.current_episode_num += 1 # Increment episode number
 
         return self._get_obs(), self._get_info()
 
@@ -273,19 +377,51 @@ class DnDCombatEnv(gym.Env):
     def action_map(self):
         return self._action_map
 
-    def _decode_action(self, action_int: int) -> Dict[str, Any]:
-        if not (0 <= action_int < len(self.action_map)):
-            raise ValueError(f"Invalid action integer: {action_int}")
-        return self.action_map[action_int]
+    def _decode_action(self, action_int: int, is_enemy: bool = False) -> Dict[str, Any]:
+        # The global _action_map is defined based on agent's capabilities in __init__.
+        # If is_enemy is True, the model for the enemy is assumed to output an action_int
+        # that maps to this same structure. The 'index' for attack/bonus actions
+        # will then refer to the enemy's specific list of attacks/bonus actions.
+
+        if not (0 <= action_int < len(self._action_map)):
+            # This check uses the length of the agent-defined _action_map.
+            # This implies the enemy model's action space must be compatible in size.
+            raise ValueError(f"Invalid action integer: {action_int} for actor {'enemy' if is_enemy else 'agent'}")
+
+        # Get the generic action template from the agent-defined map
+        action_details = self._action_map[action_int].copy() # Use a copy to avoid modifying the template
+
+        actor = self.enemy if is_enemy else self.agent
+
+        if action_details["type"] == "attack":
+            attack_idx = action_details.get("index")
+            if attack_idx is None or not (0 <= attack_idx < len(actor.attacks)):
+                # Fallback if model chooses an attack index that the current actor doesn't have
+                return {"type": "pass", "name": f"pass_invalid_attack_idx_{attack_idx}"}
+            # Update name for clarity, index is used directly on actor's attack list
+            action_details["name"] = f"attack_{actor.attacks[attack_idx].get('name', f'idx{attack_idx}')}"
+        
+        elif action_details["type"] == "bonus_action":
+            bonus_idx = action_details.get("index")
+            if bonus_idx is None or not (0 <= bonus_idx < len(actor.bonus_actions)):
+                # Fallback for invalid bonus action index
+                return {"type": "pass", "name": f"pass_invalid_bonus_idx_{bonus_idx}"}
+            # Update name for clarity
+            action_details["name"] = f"bonus_{actor.bonus_actions[bonus_idx]}" # Assumes bonus_actions are strings (names)
+            # If bonus_actions were dicts, it would be: actor.bonus_actions[bonus_idx].get('name', f'idx{bonus_idx}')
+        
+        return action_details
 
     def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
         self.current_episode_steps += 1 # Increment step counter
+        info = {} # Initialize info dictionary
 
         terminated = False
         truncated = False 
         reward = -0.1  # Overall step penalty
 
         decoded_action = self._decode_action(action)
+        info['agent_action'] = decoded_action # Store agent's chosen action type
 
         # Agent's Turn
         if self.agent.can_act():
@@ -332,18 +468,32 @@ class DnDCombatEnv(gym.Env):
                     action_taken_successfully = False # Action could not be processed.
 
             elif decoded_action["type"] == "attack":
+                action_taken_successfully = True # Attempting an attack is usually a successful action choice
                 attack_idx = decoded_action["index"]
-                # Check distance for melee/ranged attacks - future improvement
-                # For now, assume any attack can be attempted.
-                old_enemy_hp = self.enemy.current_hp
-                hit, _ = self.agent.make_attack(self.enemy, attack_idx, self.dice_roller) # Raw damage roll not used directly for reward
-                action_taken_successfully = True # Attempting an attack is an action
-                if hit:
-                    actual_damage_dealt = old_enemy_hp - self.enemy.current_hp # Calculate actual HP lost
-                    reward += actual_damage_dealt
-                if not self.enemy.is_alive:
-                    terminated = True
-                    reward += 100 # Win reward
+                selected_attack_stats = self.agent.attacks[attack_idx]
+                attack_name = selected_attack_stats.get("name", f"Attack {attack_idx}")
+                attack_range = selected_attack_stats.get("range", 1) # Default range to 1 if not specified
+                
+                distance_to_enemy = self._calculate_manhattan_distance(self.agent.position, self.enemy.position)
+                info['agent_action_details'] = f"Attempt Attack: {attack_name} (Range: {attack_range}), Target Dist: {distance_to_enemy}"
+
+                if distance_to_enemy <= attack_range:
+                    old_enemy_hp = self.enemy.current_hp
+                    hit, _ = self.agent.make_attack(self.enemy, attack_idx, self.dice_roller)
+                    actual_damage_dealt = old_enemy_hp - self.enemy.current_hp
+                    
+                    if hit:
+                        reward += actual_damage_dealt 
+                        info['agent_attack_outcome'] = f"Hit, dealt {actual_damage_dealt} damage."
+                    else:
+                        info['agent_attack_outcome'] = "Miss."
+
+                    if not self.enemy.is_alive:
+                        reward += 100 # Win reward
+                        terminated = True
+                        info['combat_outcome'] = "Agent won"
+                else:
+                    info['agent_attack_outcome'] = "Out of range."
             
             elif decoded_action["type"] == "bonus_action":
                 ba_name = decoded_action["name"]
@@ -373,7 +523,7 @@ class DnDCombatEnv(gym.Env):
             # Agent survival reward for this turn (if action didn't end episode)
             # (The 'if not action_taken_successfully: pass' block was removed as it was neutral)
             if self.agent.is_alive and not terminated:
-                reward += 0.5
+                reward += 0.1
 
         # If agent's action caused termination (e.g. enemy defeated by agent's attack)
         if terminated:
@@ -382,90 +532,159 @@ class DnDCombatEnv(gym.Env):
         # Enemy's Turn
         if self.enemy.can_act(): # Check if enemy can act before its turn starts
             self.enemy.speed_remaining = self.enemy.speed_total # Reset enemy speed for its turn
-
             dist_to_agent = self._calculate_manhattan_distance(self.enemy.position, self.agent.position)
-            
-            if dist_to_agent == 1: # Adjacent (Manhattan distance for cardinal, not diagonal)
-                if self.enemy.attacks: # Check if enemy has any attacks
-                    # Enemy attacks agent (e.g., its first available attack)
-                    hit, damage = self.enemy.make_attack(self.agent, 0, self.dice_roller)
-                    if hit:
-                        reward -= damage * 0.1 # Penalty scaled by damage taken
-                    if not self.agent.is_alive:
-                        terminated = True
-                        reward -= 50 # Large penalty for agent defeat
-                # If adjacent but no attacks (or chose not to attack), then consider moving.
-                # This else is now tied to 'if self.enemy.attacks:'
-                # If there are no attacks, it will fall through to the movement logic below.
-                # To make it explicit: if it didn't attack (either no attacks or other reason), it might move.
-                # For simplicity, let's assume if it's adjacent and can't/doesn't attack, it will use the move logic.
-                # This requires restructuring slightly: the move logic should be callable if not attacking OR not adjacent.
 
-            # Unified movement logic for enemy if it didn't attack (or isn't adjacent)
-            # Condition: if it's not adjacent OR (it is adjacent AND it did not attack)
-            # The 'did not attack' part is tricky if attacks list is empty.
-            # Let's simplify: if adjacent and has attacks, it attacks. Otherwise, it tries to move.
-            
-            enemy_attacked_this_turn = False
-            if dist_to_agent == 1 and self.enemy.attacks:
-                old_agent_hp = self.agent.current_hp
-                hit, _ = self.enemy.make_attack(self.agent, 0, self.dice_roller) # Raw damage roll not used directly
-                enemy_attacked_this_turn = True
-                if hit:
-                    actual_damage_taken = old_agent_hp - self.agent.current_hp # Calculate actual HP lost
-                    reward -= actual_damage_taken
-                if not self.agent.is_alive:
-                    terminated = True
-                    reward -= 100 # Loss penalty
-            
-            if not enemy_attacked_this_turn: # Move if not adjacent OR if adjacent but chose not/could not attack
-                # Cost for enemy's 1-cell move attempt
-                enemy_move_cost = 1 
-                if self.enemy.speed_remaining >= enemy_move_cost:
-                    dx, dy = 0, 0
-                    if self.agent.position[0] > self.enemy.position[0]: dx = 1
-                    elif self.agent.position[0] < self.enemy.position[0]: dx = -1
+            if self.enemy_is_model_controlled and self.enemy_model and self.enemy_obs_flattener:
+                info['enemy_ai_type'] = 'model_controlled'
+                enemy_obs_dict = self._get_enemy_observation()
+                flat_enemy_obs = self.enemy_obs_flattener.observation(enemy_obs_dict)
+                enemy_action_id_array, _ = self.enemy_model.predict(flat_enemy_obs, deterministic=True)
+                enemy_action_id = int(enemy_action_id_array.item()) # Convert numpy array to int
+                
+                decoded_enemy_action = self._decode_action(enemy_action_id, is_enemy=True)
+                info['enemy_action_choice'] = f"Model chose: {decoded_enemy_action.get('type')} ({decoded_enemy_action.get('name', 'N/A')}; id {enemy_action_id})"
+                
+                enemy_action_type = decoded_enemy_action.get("type")
+                enemy_action_param_idx = decoded_enemy_action.get("index") 
+                enemy_action_delta = decoded_enemy_action.get("delta")
+
+                # enemy_action_taken_successfully = False # Not currently used for reward for enemy model
+                if enemy_action_type == "move":
+                    if enemy_action_delta:
+                        dx, dy = enemy_action_delta
+                        cost_for_this_move_action = 1 
+                        if self.enemy.speed_remaining >= cost_for_this_move_action:
+                            target_x = self.enemy.position[0] + dx
+                            target_y = self.enemy.position[1] + dy
+                            if [target_x, target_y] == self.agent.position: 
+                                self.enemy.speed_remaining -= cost_for_this_move_action
+                                info['enemy_move_outcome'] = "Blocked by agent."
+                            elif self._is_valid_position(target_x, target_y): 
+                                if self.enemy.move(dx, dy, self.map_width, self.map_height):
+                                    info['enemy_move_outcome'] = f"Moved ({dx},{dy})."
+                                else: 
+                                     info['enemy_move_outcome'] = "Move failed (e.g. speed issue in Creature.move)."
+                            else: # Hit wall
+                                self.enemy.speed_remaining -= cost_for_this_move_action
+                                info['enemy_move_outcome'] = "Hit wall."
+                        else:
+                             info['enemy_move_outcome'] = "Not enough speed for move action."
+                    else: 
+                        info['enemy_move_outcome'] = "Invalid move action from model (no delta)."
+
+                elif enemy_action_type == "attack":
+                    attack_idx = enemy_action_param_idx
+                    if attack_idx is not None and 0 <= attack_idx < len(self.enemy.attacks):
+                        selected_attack_stats = self.enemy.attacks[attack_idx]
+                        attack_name = selected_attack_stats.get("name", f"Attack {attack_idx}")
+                        attack_range = selected_attack_stats.get("range", 1)
+                        
+                        if dist_to_agent <= attack_range: 
+                            info['enemy_action_details'] = f"Model Attack: {attack_name} (Range: {attack_range}), Target Dist: {dist_to_agent}"
+                            old_agent_hp = self.agent.current_hp
+                            hit, _ = self.enemy.make_attack(self.agent, attack_idx, self.dice_roller)
+                            actual_damage_taken = old_agent_hp - self.agent.current_hp
+                            if hit:
+                                reward -= actual_damage_taken
+                                info['enemy_attack_outcome'] = f"Hit, dealt {actual_damage_taken} damage."
+                            else:
+                                info['enemy_attack_outcome'] = "Miss."
+                            if not self.agent.is_alive:
+                                reward -= 100; terminated = True; info['combat_outcome'] = "Enemy won (model)"
+                        else:
+                            info['enemy_attack_outcome'] = "Out of range."
+                    else: 
+                        info['enemy_attack_outcome'] = f"Invalid attack index {attack_idx} from model / Pass."
+                
+                elif enemy_action_type == "pass":
+                    info['enemy_action_details'] = "Model chose Pass."
+                
+                elif enemy_action_type == "bonus_action":
+                    ba_name_enemy = decoded_enemy_action.get("name") # Get name from decoded action
+                    is_valid_bonus = False
+                    if hasattr(self.enemy, 'bonus_actions'):
+                         # Check if the string ba_name_enemy is in the list self.enemy.bonus_actions
+                        if ba_name_enemy in self.enemy.bonus_actions:
+                             is_valid_bonus = True
                     
-                    if self.agent.position[1] > self.enemy.position[1]: dy = 1
-                    elif self.agent.position[1] < self.enemy.position[1]: dy = -1
+                    if is_valid_bonus and ba_name_enemy == "bonus_move_1_cell":
+                         self.enemy.speed_remaining +=1
+                         info['enemy_bonus_outcome'] = "Used bonus_move_1_cell."
+                    else:
+                         info['enemy_bonus_outcome'] = f"Bonus action '{ba_name_enemy}' not implemented or not available for enemy."
+                    info['enemy_action_details'] = f"Model chose Bonus Action: {ba_name_enemy}"
 
-                    # Attempt to move towards agent, check occupation
-                    # Try x-axis move first
-                    enemy_target_x_try1 = self.enemy.position[0] + dx
-                    enemy_target_y_try1 = self.enemy.position[1]
+
+                # Fallback for unhandled or invalid actions from model if no specific outcome was logged
+                if 'enemy_move_outcome' not in info and 'enemy_attack_outcome' not in info and \
+                   'enemy_bonus_outcome' not in info and enemy_action_type != "pass":
+                    info['enemy_action_details'] = info.get('enemy_action_details', "") + " Model chose unhandled or invalid action type, resulted in Pass."
+
+            else: # Rule-based AI for enemy (if not model-controlled)
+                info['enemy_ai_type'] = 'rule_based'
+                enemy_attacked_this_turn = False
+                # Rule-based AI: Attack if its first attack is in range
+                if self.enemy.attacks:
+                    enemy_attack_stats = self.enemy.attacks[0]
+                    enemy_attack_range = enemy_attack_stats.get("range", 1)
+                    if dist_to_agent <= enemy_attack_range : 
+                        old_agent_hp = self.agent.current_hp
+                        hit, _ = self.enemy.make_attack(self.agent, 0, self.dice_roller) 
+                        enemy_attacked_this_turn = True
+                        info['enemy_action_details'] = f"Rule-based Attack: {self.enemy.attacks[0].get('name')}"
+                        if hit:
+                            actual_damage_taken = old_agent_hp - self.agent.current_hp 
+                            reward -= actual_damage_taken
+                            info['enemy_attack_outcome'] = f"Hit, dealt {actual_damage_taken} damage."
+                        else:
+                            info['enemy_attack_outcome'] = "Miss."
+                        if not self.agent.is_alive:
+                            terminated = True
+                            reward -= 100 
+                            info['combat_outcome'] = "Enemy won (rule-based)"
+                
+                if not enemy_attacked_this_turn: 
+                    current_action_detail = info.get('enemy_action_details', "") # Preserve potential "out of range" from attack attempt
+                    if current_action_detail and not current_action_detail.endswith(" "): current_action_detail += " " 
+                    info['enemy_action_details'] = current_action_detail + "Rule-based decided to move."
                     
-                    moved_enemy = False
-                    # X-axis movement attempt
-                    if dx != 0:
-                        target_x = self.enemy.position[0] + dx
-                        target_y = self.enemy.position[1]
+                    enemy_move_cost = 1 
+                    if self.enemy.speed_remaining >= enemy_move_cost:
+                        dx, dy = 0, 0
+                        if self.agent.position[0] > self.enemy.position[0]: dx = 1
+                        elif self.agent.position[0] < self.enemy.position[0]: dx = -1
+                        if self.agent.position[1] > self.enemy.position[1]: dy = 1
+                        elif self.agent.position[1] < self.enemy.position[1]: dy = -1
                         
-                        is_target_agent_occupied = ([target_x, target_y] == self.agent.position)
-                        is_target_map_valid = self._is_valid_position(target_x, target_y)
-
-                        can_move_to_target = is_target_map_valid and not is_target_agent_occupied
-                        if can_move_to_target:
-                            if self.enemy.move(dx, 0, self.map_width, self.map_height): # move() deducts speed
-                                moved_enemy = True
+                        moved_enemy = False
+                        # X-axis movement attempt
+                        if dx != 0:
+                            target_x = self.enemy.position[0] + dx
+                            target_y = self.enemy.position[1]
+                            is_target_agent_occupied = ([target_x, target_y] == self.agent.position)
+                            is_target_map_valid = self._is_valid_position(target_x, target_y)
+                            can_move_to_target = is_target_map_valid and not is_target_agent_occupied
+                            if can_move_to_target:
+                                if self.enemy.move(dx, 0, self.map_width, self.map_height):
+                                    moved_enemy = True
+                            if not can_move_to_target: 
+                                self.enemy.speed_remaining -= enemy_move_cost 
                         
-                        if not can_move_to_target: # Collision with wall OR agent
-                            self.enemy.speed_remaining -= enemy_move_cost 
-                    
-                    # Y-axis movement attempt (only if no x-move occurred or dx was 0)
-                    if not moved_enemy and dy != 0:
-                        target_x = self.enemy.position[0]
-                        target_y = self.enemy.position[1] + dy
-
-                        is_target_agent_occupied = ([target_x, target_y] == self.agent.position)
-                        is_target_map_valid = self._is_valid_position(target_x, target_y)
+                        # Y-axis movement attempt
+                        if not moved_enemy and dy != 0:
+                            target_x = self.enemy.position[0]
+                            target_y = self.enemy.position[1] + dy
+                            is_target_agent_occupied = ([target_x, target_y] == self.agent.position)
+                            is_target_map_valid = self._is_valid_position(target_x, target_y)
+                            can_move_to_target = is_target_map_valid and not is_target_agent_occupied
+                            if can_move_to_target:
+                                if self.enemy.move(0, dy, self.map_width, self.map_height):
+                                    moved_enemy = True 
+                            if not can_move_to_target:
+                                self.enemy.speed_remaining -= enemy_move_cost
                         
-                        can_move_to_target = is_target_map_valid and not is_target_agent_occupied
-                        if can_move_to_target:
-                            if self.enemy.move(0, dy, self.map_width, self.map_height): # move() deducts speed
-                                moved_enemy = True 
-                        
-                        if not can_move_to_target: # Collision with wall OR agent
-                            self.enemy.speed_remaining -= enemy_move_cost
+                        if moved_enemy: info["enemy_move_outcome"] = "Moved (rule-based)."
+                        else: info["enemy_move_outcome"] = "Move attempt failed or blocked (rule-based)."
 
         # Check for truncation due to max steps
         if not terminated and self.current_episode_steps >= self.max_episode_steps:
@@ -548,6 +767,17 @@ class DnDCombatEnv(gym.Env):
                 return None 
             
             self._render_pygame_frame(self.screen)
+
+            if self.export_frames_path:
+                step_num_for_filename = self.current_episode_steps if hasattr(self, 'current_episode_steps') else 0
+                episode_num_for_filename = self.current_episode_num if hasattr(self, 'current_episode_num') else 0
+                
+                filename = os.path.join(self.export_frames_path, f"e{episode_num_for_filename:03d}_s{step_num_for_filename:04d}.png")
+                try:
+                    pygame.image.save(self.screen, filename)
+                except Exception as e:
+                    print(f"Error saving frame {filename}: {e}")
+
             pygame.display.flip()
             self.clock.tick(self.metadata['render_fps'])
             
