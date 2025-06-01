@@ -164,10 +164,8 @@ def main():
         episode_step_count = 0
 
         # Ensure enemy model is loaded if specified (env handles this if enemy_model_path was given)
-        if not env.enemy_is_model_controlled and args.model2_path:
-             # This case implies the env was initialized without model2_path for some reason,
-             # or model loading failed internally in env. This shouldn't typically be hit
-             # if setup is correct.
+        # Accessing env.env since 'env' is FlattenObservation wrapped
+        if not env.env.enemy_is_model_controlled and args.model2_path:
              print("Warning: Enemy model path was provided but enemy is not model-controlled in env.")
 
 
@@ -177,14 +175,15 @@ def main():
             episode_step_count += 1
 
         # Determine outcome
+        # Access actual environment through env.env to get agent/enemy attributes
         if terminated:
-            if env.agent.is_alive and not env.enemy.is_alive:
+            if env.env.agent.is_alive and not env.env.enemy.is_alive:
                 model1_wins += 1
-            elif not env.agent.is_alive and env.enemy.is_alive:
+            elif not env.env.agent.is_alive and env.env.enemy.is_alive:
                 model2_wins += 1
             else: # Both died in the same step, or some other terminal state
                 draws += 1
-                # print(f"Debug: Episode {episode_num} ended in a draw (terminated). Agent alive: {env.agent.is_alive}, Enemy alive: {env.enemy.is_alive}")
+                # print(f"Debug: Episode {episode_num} ended in a draw (terminated). Agent alive: {env.env.agent.is_alive}, Enemy alive: {env.env.enemy.is_alive}")
         elif truncated: # Episode ended due to max_steps
             draws += 1
             # print(f"Debug: Episode {episode_num} ended in a draw (truncated).")
