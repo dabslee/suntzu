@@ -4,8 +4,14 @@ import os # For skipping human render test in headless CI
 from gymnasium import spaces 
 from dnd_gym_env import Creature, DnDCombatEnv 
 from dice import roll 
-from bestiary.commoner import get_commoner_stats # For render tests
-from bestiary.wolf import get_wolf_stats     # For render tests
+from bestiary.commoner import get_commoner_stats
+from bestiary.wolf import get_wolf_stats
+from bestiary.cat import get_cat_stats
+from bestiary.bandit import get_bandit_stats
+from bestiary.guard import get_guard_stats
+from bestiary.goblin import get_goblin_stats
+from bestiary.scout import get_scout_stats
+from typing import Optional # Added for the helper function type hint
 
 # --- Test Creature Class ---
 
@@ -687,26 +693,62 @@ def get_action_idx(env_instance, action_type_or_name: str, attack_name: Optional
     for i, action_def in enumerate(env_instance.action_map):
         if action_def["type"] == action_type_or_name:
             if action_type_or_name == "attack" and attack_name:
-                if action_def["name"] == f"attack_{attack_name}":
+                # Ensure attack_name is from the creature's attack list for safety
+                # This part of the logic might need to be more robust if names can clash
+                # or if index is preferred. For now, matching name as per current structure.
+                if hasattr(env_instance, 'agent') and action_def['name'] == f"attack_{attack_name}":
+                    return i
+                elif hasattr(env_instance, 'enemy') and action_def['name'] == f"attack_{attack_name}": # Check enemy too if context implies
                     return i
             elif action_type_or_name != "attack": # For non-attack types, type matching is enough, or use name
                  if action_def["name"] == action_type_or_name: # e.g. "dash", "dodge"
                     return i
         # Allow searching by just the unique name if it's not a generic type like "attack"
-        if action_def["name"] == action_type_or_name and action_type_or_name not in ["attack", "move", "bonus_action"]:
+        if action_def["name"] == action_type_or_name and \
+           action_type_or_name not in ["attack", "move", "bonus_action"]: # Avoid overly generic name matches for these types
              return i
 
 
     # Fallback for simple types if name wasn't specific enough initially
-    if action_type_or_name in ["attack", "move", "bonus_action", "pass_turn", "end_turn", "dash", "disengage", "dodge"]:
+    # and no specific sub_name (like attack_name) was provided.
+    if action_type_or_name in ["attack", "move", "bonus_action", "pass_turn", "end_turn", "dash", "disengage", "dodge"] and not attack_name:
         for i, action_def in enumerate(env_instance.action_map):
              if action_def["type"] == action_type_or_name:
                   return i # Return first match for generic types if no sub-name given
 
-    raise ValueError(f"Action {action_type_or_name} (sub-name: {attack_name}) not found in env action_map: {env_instance.action_map}")
+    raise ValueError(f"Action '{action_type_or_name}' (Attack Name: '{attack_name}') not found in env action_map: {env_instance.action_map}")
 
 
 # --- Tests for New Mechanics ---
+
+# Expected keys for any creature stat block
+EXPECTED_STAT_KEYS = ["ac", "max_hp", "speed_total", "attacks", "bonus_actions"]
+
+@pytest.mark.parametrize("stat_func, creature_name", [
+    (get_cat_stats, "Cat"),
+    (get_bandit_stats, "Bandit"),
+    (get_guard_stats, "Guard"),
+    (get_goblin_stats, "Goblin"),
+    (get_scout_stats, "Scout"),
+    (get_commoner_stats, "Commoner"),
+    (get_wolf_stats, "Wolf"),
+])
+def test_creature_stat_function_structure(stat_func, creature_name):
+    stats = stat_func()
+    assert isinstance(stats, dict), f"{creature_name} stats should be a dict"
+    for key in EXPECTED_STAT_KEYS:
+        assert key in stats, f"{creature_name} stats missing key: {key}"
+
+    assert isinstance(stats["attacks"], list), f"{creature_name} 'attacks' should be a list"
+    assert isinstance(stats["bonus_actions"], list), f"{creature_name} 'bonus_actions' should be a list"
+
+    if stats["attacks"]:
+        first_attack = stats["attacks"][0]
+        assert isinstance(first_attack, dict), f"{creature_name} first attack should be a dict"
+        expected_attack_keys = ["name", "to_hit", "damage_dice", "range", "attack_type", "num_attacks"]
+        for key in expected_attack_keys:
+            assert key in first_attack, f"{creature_name} first attack missing key: {key} in {first_attack}"
+
 
 def test_action_economy_rules(dnd_env):
     dnd_env.reset(seed=100)
