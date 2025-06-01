@@ -8,15 +8,25 @@ import time # For progress updates
 try:
     from stable_baselines3 import DQN
     from stable_baselines3.common.env_util import make_vec_env # If needed, but likely direct env use
+    from stable_baselines3 import DQN
+    from stable_baselines3.common.env_util import make_vec_env # If needed, but likely direct env use
+    from gymnasium.wrappers import FlattenObservation # Ensure this is imported
     SB3_AVAILABLE = True
 except ImportError:
     SB3_AVAILABLE = False
-    print("Warning: stable-baselines3 not found. Evaluation script will not work.")
+    print("Warning: stable-baselines3 or gymnasium.wrappers not found. Evaluation script will not work.")
     # Define dummy DQN for parsing if needed, or exit early in main
     class DQN:
         @staticmethod
         def load(path, device='auto'):
             raise NotImplementedError("SB3 DQN not available.")
+    class FlattenObservation: # Dummy for when SB3 is not available
+        def __init__(self, env):
+            self.env = env
+            self.observation_space = env.observation_space # Placeholder
+        def observation(self, obs): return obs # Placeholder
+        def __getattr__(self, name): return getattr(self.env, name) # Pass through other attributes
+
 
 from dnd_gym_env import DnDCombatEnv, Creature # Assuming Creature might be useful for type hints or direct use
 # Bestiary imports will be dynamic based on args
@@ -120,7 +130,10 @@ def main():
         # For SB3, make_vec_env handles seeding. If using direct env, seed on reset.
         # We'll ensure reset uses the seed later in the evaluation loop.
         print(f"Environment will be seeded with: {args.env_seed} during reset.")
-    print("Environment initialized.")
+
+    # Wrap the environment for Model 1
+    env = FlattenObservation(env)
+    print("Environment initialized and wrapped with FlattenObservation.")
 
     # Load Model 1 (Agent)
     print(f"Loading Model 1 (Agent) from: {args.model1_path}")
