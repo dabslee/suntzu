@@ -158,7 +158,7 @@ class Creature:
         self.is_dodging = False
         # Disengage effect also typically ends at the start of the next turn or after movement.
         self.is_disengaging = False # Or handle this more granularly if disengage ends after any move.
-        
+
         # Reset speed. Dash effect from previous turn ends.
         self.speed_remaining = self.speed_total # Base speed for the new turn
         self.took_dash_action_this_turn = False # Dash action itself is for the current turn
@@ -294,35 +294,16 @@ class DnDCombatEnv(gym.Env):
         
         self.dice_roller = roll
 
-        # Define Action Space
-        self._action_map: List[Dict[str, Any]] = []
-        # 1. Move actions (NSEW, 1 cell at a time)
-        self._action_map.append({"type": "move", "delta": (0, -1), "name": "move_N"}) # North
-        self._action_map.append({"type": "move", "delta": (0, 1), "name": "move_S"})  # South
-        self._action_map.append({"type": "move", "delta": (1, 0), "name": "move_E"})  # East
-        self._action_map.append({"type": "move", "delta": (-1, 0), "name": "move_W"}) # West
+        # Build action maps
+        self._agent_action_map = self._build_action_map_for_creature(self.agent)
+        self.action_space = spaces.Discrete(len(self._agent_action_map))
+
+        self._enemy_action_map_for_validation = None
+        if self.enemy_is_model_controlled: # This flag is set after attempting to load enemy_model
+            self._enemy_action_map_for_validation = self._build_action_map_for_creature(self.enemy)
+            if self._enemy_action_map_for_validation is None:
+                 print("Warning: Could not build enemy action map even if model controlled.")
         
-        # 2. Attack actions
-        for i, attack_details in enumerate(self.agent.attacks):
-            self._action_map.append({"type": "attack", "index": i, "name": f"attack_{attack_details['name']}"})
-            
-        # 3. Bonus Actions
-        for i, ba_name in enumerate(self.agent.bonus_actions):
-            self._action_map.append({"type": "bonus_action", "name": ba_name, "index": i})
-
-        # 4. Pass action
-        self._action_map.append({"type": "pass", "name": "pass_turn"})
-
-        # 5. Standard Actions (Dash, Disengage, Dodge)
-        self._action_map.append({"type": "dash", "name": "dash"})
-        self._action_map.append({"type": "disengage", "name": "disengage"})
-        self._action_map.append({"type": "dodge", "name": "dodge"})
-
-        # 6. End turn
-        self._action_map.append({"type": "end_turn", "name": "end_turn"})
-        
-        self.action_space = spaces.Discrete(len(self.action_map))
-
         # Define Observation Space
         max_coord = max(self.map_width, self.map_height) -1
         max_dist = self.map_width + self.map_height # Max Manhattan distance
@@ -441,21 +422,80 @@ class DnDCombatEnv(gym.Env):
 
     @property # Make it accessible like a variable but defined as a method
     def action_map(self):
-        return self._action_map
+        # This property is what external things (like tests or example runners) might use.
+        # It should reflect the agent's perspective.
+        return self._agent_action_map
+
+    def _build_action_map_for_creature(self, creature: Creature) -> List[Dict[str, Any]]:
+        action_map = []
+        # 1. Move actions (NSEW, 1 cell at a time) - These are standard
+        action_map.append({"type": "move", "delta": (0, -1), "name": "move_N"}) # North
+        action_map.append({"type": "move", "delta": (0, 1), "name": "move_S"})  # South
+        action_map.append({"type": "move", "delta": (1, 0), "name": "move_E"})  # East
+        action_map.append({"type": "move", "delta": (-1, 0), "name": "move_W"}) # West
+
+        # 2. Attack actions - Specific to the creature
+        for i, attack_details in enumerate(creature.attacks):
+            action_map.append({"type": "attack", "index": i, "name": f"attack_{attack_details['name']}"})
+
+        # 3. Bonus Actions - Specific to the creature
+        for i, ba_name_or_dict in enumerate(creature.bonus_actions):
+            if isinstance(ba_name_or_dict, str):
+                action_map.append({"type": "bonus_action", "name": ba_name_or_dict, "index": i})
+            elif isinstance(ba_name_or_dict, dict): # If bonus actions become more structured
+                 action_map.append({
+                     "type": "bonus_action",
+                     "name": ba_name_or_dict.get("name", f"bonus_action_{i}"),
+                     "index": i,
+                     **ba_name_or_dict # Merge other details if any
+                 })
+
+        # 4. Standard D&D Actions (Dash, Disengage, Dodge)
+        action_map.append({"type": "dash", "name": "dash"})
+        action_map.append({"type": "disengage", "name": "disengage"})
+        action_map.append({"type": "dodge", "name": "dodge"})
+
+        # 5. Pass / End Turn action
+        action_map.append({"type": "pass_turn", "name": "pass_turn"})
+        action_map.append({"type": "end_turn", "name": "end_turn"})
+
+        return action_map
 
     def _decode_action(self, action_int: int, is_enemy: bool = False) -> Dict[str, Any]:
-        # The global _action_map is defined based on agent's capabilities in __init__.
-        # If is_enemy is True, the model for the enemy is assumed to output an action_int
-        # that maps to this same structure. The 'index' for attack/bonus actions
-        # will then refer to the enemy's specific list of attacks/bonus actions.
+        map_to_use = self._agent_action_map # Default to agent's map
+        actor_for_map_construction = self.agent # For debug message
 
-        if not (0 <= action_int < len(self._action_map)):
-            # This check uses the length of the agent-defined _action_map.
-            # This implies the enemy model's action space must be compatible in size.
-            raise ValueError(f"Invalid action integer: {action_int} for actor {'enemy' if is_enemy else 'agent'}")
+        if is_enemy and self.enemy_is_model_controlled and self._enemy_action_map_for_validation is not None:
+            map_to_use = self._enemy_action_map_for_validation
+            actor_for_map_construction = self.enemy # For debug message
+            # print(f"DEBUG: Decoding enemy action using enemy_action_map. Action int: {action_int}, Map size: {len(map_to_use)}")
+        # else:
+            # print(f"DEBUG: Decoding agent action using agent_action_map. Action int: {action_int}, Map size: {len(map_to_use)}")
 
-        # Get the generic action template from the agent-defined map
-        action_details = self._action_map[action_int].copy() # Use a copy to avoid modifying the template
+        if not (0 <= action_int < len(map_to_use)):
+            actor_type = "enemy" if is_enemy else "agent"
+            map_type_used = "enemy_specific_map" if (is_enemy and self.enemy_is_model_controlled and self._enemy_action_map_for_validation is not None) else "agent_map"
+
+            err_msg = (
+                f"Invalid action integer: {action_int} for actor '{actor_type}'. "
+                f"Attempted to use {map_type_used} with size {len(map_to_use)}. "
+                f"Actor's actual attacks: {len(self.enemy.attacks if is_enemy else self.agent.attacks)}, "
+                f"Actor's actual bonus_actions: {len(self.enemy.bonus_actions if is_enemy else self.agent.bonus_actions)}."
+            )
+            move_actions_in_map = sum(1 for action in map_to_use if action["type"] == "move")
+            attack_actions_in_map = sum(1 for action in map_to_use if action["type"] == "attack")
+            bonus_actions_in_map = sum(1 for action in map_to_use if action["type"] == "bonus_action")
+            standard_actions_in_map = sum(1 for action in map_to_use if action["type"] in ["dash", "disengage", "dodge"])
+            pass_end_actions_in_map = sum(1 for action in map_to_use if action["type"] in ["pass_turn", "end_turn"])
+
+            err_msg += (
+                f" Map structure (used for decoding): Moves={move_actions_in_map}, Attacks={attack_actions_in_map}, "
+                f"BonusActions={bonus_actions_in_map}, StandardActions={standard_actions_in_map}, "
+                f"Pass/End={pass_end_actions_in_map}."
+            )
+            raise ValueError(err_msg)
+
+        action_details = map_to_use[action_int].copy()
 
         actor = self.enemy if is_enemy else self.agent
 
@@ -811,7 +851,7 @@ class DnDCombatEnv(gym.Env):
                                 info['enemy_attack_modifier'] = info.get('enemy_attack_modifier', "") + " Agent dodging, attack at disadvantage."
 
                         info['enemy_action_details'] = f"Model Attack: {attack_name} (Range: {attack_range}, Type: {enemy_attack_type}, Adv/Disadv: {enemy_adv_disadv_status}), Target Dist: {dist_to_agent}"
-                        
+
                         if dist_to_agent <= attack_range:
                             old_agent_hp = self.agent.current_hp
                             hit, _ = self.enemy.make_attack(self.agent, attack_idx, self.dice_roller, advantage_disadvantage=enemy_adv_disadv_status)
