@@ -19,28 +19,27 @@ except ImportError:
     class DummyVecEnv: pass
     class FlattenObservation: pass
 
+import importlib # Added for dynamic stat loading
+
 # Project-specific imports
 try:
     from dnd_gym_env import DnDCombatEnv
-    from bestiary.commoner import get_commoner_stats
-    from bestiary.wolf import get_wolf_stats
+    # Direct imports of get_commoner_stats and get_wolf_stats are no longer needed here
+    # as stats will be loaded dynamically.
     PROJECT_ENV_AVAILABLE = True
 except ImportError:
     PROJECT_ENV_AVAILABLE = False
     print("Warning: Custom D&D environment or bestiary not found. Script cannot run as intended.")
     # Define dummy classes/functions if needed for script structure if env is missing
     class DnDCombatEnv: pass 
-    def get_commoner_stats(): return {}
-    def get_wolf_stats(): return {}
+    # No need for dummy get_stats functions here anymore
 
 
 # --- Global Constants and Configuration ---
-# These will be loaded only if the environment itself was loaded
-AGENT_STATS = get_commoner_stats() if PROJECT_ENV_AVAILABLE else {}
-ENEMY_STATS = get_wolf_stats() if PROJECT_ENV_AVAILABLE else {}
+# Global AGENT_STATS and ENEMY_STATS are removed. They will be loaded dynamically.
 
-DEFAULT_MODEL_A_PATH = "models/dnd_commoner_selfplay_agent.zip"  # Agent A = Commoner
-DEFAULT_MODEL_B_PATH = "models/dnd_wolf_selfplay_agent.zip"      # Agent B = Wolf
+DEFAULT_MODEL_A_PATH = "models/dnd_agent1_selfplay.zip"
+DEFAULT_MODEL_B_PATH = "models/dnd_agent2_selfplay.zip"
 
 MAP_WIDTH = 10
 MAP_HEIGHT = 10
@@ -63,11 +62,16 @@ if __name__ == '__main__':
                         help="Number of full training iterations (A trains, then B trains). Default: 10")
     parser.add_argument("--timesteps_per_iteration", type=int, default=50000, 
                         help="Timesteps for each agent's training phase per iteration. Default: 50000")
+
+    parser.add_argument("--agent1_stats_module", type=str, required=True,
+                        help="Python module path for Agent 1's stats (e.g., 'bestiary.wolf'). Must contain get_<name>_stats().")
+    parser.add_argument("--agent2_stats_module", type=str, required=True,
+                        help="Python module path for Agent 2's stats (e.g., 'bestiary.commoner'). Must contain get_<name>_stats().")
     
     parser.add_argument("--model_a_path", type=str, default=DEFAULT_MODEL_A_PATH,
-                        help=f"Path to load/save Agent A (Commoner) model. Default: {DEFAULT_MODEL_A_PATH}")
+                        help=f"Path to load/save Agent 1 model. Default: {DEFAULT_MODEL_A_PATH}")
     parser.add_argument("--model_b_path", type=str, default=DEFAULT_MODEL_B_PATH,
-                        help=f"Path to load/save Agent B (Wolf) model. Default: {DEFAULT_MODEL_B_PATH}")
+                        help=f"Path to load/save Agent 2 model. Default: {DEFAULT_MODEL_B_PATH}")
     
     # Optional: DQN Hyperparameters
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for DQN. Default: 0.0001")
@@ -80,8 +84,10 @@ if __name__ == '__main__':
     print("--- Self-Play Training Configuration ---")
     print(f"Total Iterations: {args.iterations}")
     print(f"Timesteps per Agent per Iteration: {args.timesteps_per_iteration}")
-    print(f"Agent A (Commoner) Model: {args.model_a_path}")
-    print(f"Agent B (Wolf) Model: {args.model_b_path}")
+    print(f"Agent 1 Model: {args.model_a_path}")
+    print(f"Agent 2 Model: {args.model_b_path}")
+    print(f"Agent 1 Stats Module: {args.agent1_stats_module}")
+    print(f"Agent 2 Stats Module: {args.agent2_stats_module}")
     print(f"Learning Rate: {args.lr}")
     print(f"Buffer Size: {args.buffer_size}")
     print(f"Batch Size: {args.batch_size}")
@@ -106,82 +112,150 @@ if __name__ == '__main__':
     # For now, to make the script runnable up to this point if those functions are missing,
     # we can define placeholder/dummy versions if SB3_AVAILABLE is True.
     # This is just for structural completeness of this subtask.
-    
-    # Placeholder for initialize_model function (to be implemented later)
-    def initialize_model(model_path, is_agent_a_being_initialized, dqn_hparams, initial_opponent_model_path, training_env_lambda):
-        print(f"Placeholder: Would initialize model for {'Agent A' if is_agent_a_being_initialized else 'Agent B'} from/to {model_path}")
-        print(f"Placeholder: Initial opponent model: {initial_opponent_model_path}")
-        if os.path.exists(model_path):
-            print(f"Placeholder: Loading model from {model_path}")
-            # return DQN.load(model_path, env=training_env_lambda()) # Env might be needed if custom policy
-            return DQN.load(model_path) # Simpler load
-        else:
-            print(f"Placeholder: Creating new model, to be saved at {model_path}")
-            # env = training_env_lambda() # Create an env for initialization
-            # model = DQN("MlpPolicy", env, tensorboard_log=None, **dqn_hparams)
-            # env.close()
-            # For this placeholder, we can't create a real model without a real env.
-            # Returning a mock/dummy object or None if SB3 is available but env setup is complex.
-            # For now, let's assume it would return a new DQN model.
-            # This part will be fully implemented when make_training_env is also implemented.
-            print("Warning: initialize_model is a placeholder. Actual model creation needs make_training_env.")
-            # We need a dummy VecEnv to initialize DQN if no model path exists
-            # This is tricky as make_training_env is also a placeholder for now.
-            # For the script to run without erroring here, we'll return a basic DQN if SB3 is available.
-            if SB3_AVAILABLE:
-                 temp_env = DummyVecEnv([lambda: FlattenObservation(DnDCombatEnv(MAP_WIDTH, MAP_HEIGHT, AGENT_STATS, ENEMY_STATS))])
-                 model = DQN("MlpPolicy", temp_env, **dqn_hparams)
-                 temp_env.close()
-                 return model
-            return None # Should not be reached if SB3_AVAILABLE check passed earlier
+    # Ensure typing imports are present if not already
+    # from typing import Optional, Dict, Any (already at the top)
 
-    # Placeholder for make_training_env function (to be implemented later)
-    def make_training_env(is_training_agent_a, opponent_model_path, current_iteration, training_agent_name):
-        print(f"Placeholder: Would create training env for {'Agent A' if is_training_agent_a else 'Agent B'}")
-        print(f"Placeholder: Opponent model: {opponent_model_path}, Iter: {current_iteration}, Name: {training_agent_name}")
-        # This will be fully implemented later. For now, return a basic env for placeholder initialize_model.
-        # Actual implementation will set agent_stats, enemy_stats, and enemy_model_path based on args.
-        if PROJECT_ENV_AVAILABLE:
-            agent_s = AGENT_STATS if is_training_agent_a else ENEMY_STATS
-            enemy_s = ENEMY_STATS if is_training_agent_a else AGENT_STATS
-            # If training Agent A, enemy uses opponent_model_path (which is B's model path)
-            # If training Agent B, enemy uses opponent_model_path (which is A's model path)
-            # This is tricky because the DnDCombatEnv's "enemy_model_path" is for its internal enemy.
-            # make_training_env needs to correctly assign roles.
+    def load_stats_from_module(module_path_str: str) -> dict:
+        try:
+            actual_module_name = module_path_str.split('.')[-1]
+            expected_func_name = f"get_{actual_module_name}_stats"
+
+            module = importlib.import_module(module_path_str)
+            stats_func = getattr(module, expected_func_name)
+            print(f"Successfully loaded stats function '{expected_func_name}' from '{module_path_str}'")
+            return stats_func()
+        except ImportError:
+            print(f"Error: Could not import module '{module_path_str}'. Please check the path.")
+            raise
+        except AttributeError:
+            print(f"Error: Could not find function '{expected_func_name}' in module '{module_path_str}'.")
+            raise
+        except Exception as e:
+            print(f"An unexpected error occurred while loading stats from '{module_path_str}': {e}")
+            raise
+
+    print("\nLoading creature stats...")
+    try:
+        agent1_stats_data = load_stats_from_module(args.agent1_stats_module)
+        agent2_stats_data = load_stats_from_module(args.agent2_stats_module)
+        print("Creature stats loaded successfully.")
+        # print(f"Agent 1 Stats: {agent1_stats_data}") # Optional: for debugging
+        # print(f"Agent 2 Stats: {agent2_stats_data}") # Optional: for debugging
+    except Exception as e:
+        print(f"Failed to load creature stats. Exiting. Error: {e}")
+        exit()
+    
+    # Placeholder for initialize_model function
+    def initialize_model(model_path: str,
+                         is_agent_a_being_initialized: bool,
+                         dqn_hparams: Dict[str, Any],
+                         initial_opponent_model_path: Optional[str],
+                         training_env_lambda: Any) -> DQN: # Return type is SB3 DQN model
+        agent_name_log = "Agent 1" if is_agent_a_being_initialized else "Agent 2"
+        print(f"Initializing model for {agent_name_log} from/to {model_path}")
+        print(f"  Initial opponent model for this agent: {initial_opponent_model_path}")
+
+        if os.path.exists(model_path):
+            print(f"  Loading existing model from {model_path}")
+            # The env parameter in load is for updating model's env, not for creating new one.
+            # If custom objects are involved, it might be needed. For DQN, often not for basic load.
+            return DQN.load(model_path, device='auto')
+        else:
+            print(f"  Creating new model, to be saved at {model_path}")
+            if not SB3_AVAILABLE:
+                raise RuntimeError("Stable Baselines3 is not available, cannot create new model.")
             
-            # If Agent A is training, it's the "agent" in the env, Wolf is "enemy" (potentially model-controlled by opponent_model_path)
-            # If Agent B is training, it's the "agent" in the env, Commoner is "enemy" (potentially model-controlled by opponent_model_path)
-            current_agent_stats = AGENT_STATS if is_training_agent_a else ENEMY_STATS
-            current_enemy_stats = ENEMY_STATS if is_training_agent_a else AGENT_STATS
-            # The 'opponent_model_path' is for the 'enemy' in this setup
+            # The training_env_lambda should return a ready-to-use environment (already wrapped)
+            # However, DQN usually expects a VecEnv.
+            print("  Creating environment for new model initialization using training_env_lambda...")
+            base_env_for_init = training_env_lambda() # This should be FlattenObservation(DnDCombatEnv(...))
+            vec_env_for_init = DummyVecEnv([lambda: base_env_for_init]) # Wrap it for DQN
             
-            return FlattenObservation(
-                DnDCombatEnv(MAP_WIDTH, MAP_HEIGHT, current_agent_stats, current_enemy_stats, 
-                             enemy_model_path=opponent_model_path, # This sets the enemy of the training agent
-                             render_mode=None)
+            print(f"  New model parameters: policy=MlpPolicy, env_type={type(vec_env_for_init)}")
+            model = DQN(
+                "MlpPolicy",
+                vec_env_for_init,
+                tensorboard_log=None, # Will be set before learning
+                **dqn_hparams
             )
-        return None # Should not be reached if PROJECT_ENV_AVAILABLE check passed
+            # vec_env_for_init.close() # Close after model init if not used by caller
+            return model
+
+    # Refined make_training_env function
+    def make_training_env(is_training_agent_a: bool,
+                          opponent_model_path: Optional[str],
+                          current_iteration: int,
+                          training_agent_name: str,
+                          agent1_stats: Dict[str, Any],
+                          agent2_stats: Dict[str, Any]) -> DnDCombatEnv: # Returns base env, will be wrapped by DummyVecEnv
+
+        print(f"Creating training env for: {training_agent_name} (Iteration {current_iteration})")
+        print(f"  - Agent being trained is: {'Agent 1' if is_training_agent_a else 'Agent 2'}")
+        print(f"  - Opponent model path: {opponent_model_path}")
+
+        if is_training_agent_a:
+            current_agent_true_stats = agent1_stats
+            current_opponent_true_stats = agent2_stats
+            print(f"  - Env Agent Stats (Agent 1): AC {current_agent_true_stats.get('ac', 'N/A')}, HP {current_agent_true_stats.get('max_hp', 'N/A')}")
+            print(f"  - Env Enemy Stats (Agent 2): AC {current_opponent_true_stats.get('ac', 'N/A')}, HP {current_opponent_true_stats.get('max_hp', 'N/A')}")
+        else:
+            current_agent_true_stats = agent2_stats
+            current_opponent_true_stats = agent1_stats
+            print(f"  - Env Agent Stats (Agent 2): AC {current_agent_true_stats.get('ac', 'N/A')}, HP {current_agent_true_stats.get('max_hp', 'N/A')}")
+            print(f"  - Env Enemy Stats (Agent 1): AC {current_opponent_true_stats.get('ac', 'N/A')}, HP {current_opponent_true_stats.get('max_hp', 'N/A')}")
+
+        if not PROJECT_ENV_AVAILABLE:
+            raise RuntimeError("DnDCombatEnv not available for make_training_env.")
+
+        # The environment's "agent" is the one being trained.
+        # Its "enemy" is the opponent, potentially model-controlled by opponent_model_path.
+        env = DnDCombatEnv(
+            map_width=MAP_WIDTH,
+            map_height=MAP_HEIGHT,
+            agent_stats=current_agent_true_stats,
+            enemy_stats=current_opponent_true_stats,
+            enemy_model_path=opponent_model_path,
+            render_mode=None
+        )
+        # Return the base environment. FlattenObservation and DummyVecEnv will be applied outside or in initialize_model.
+        return env # Return the base env
 
     # --- Initialize Models ---
-    print("\nInitializing Agent A (Commoner)...")
-    # For Agent A (Commoner), its opponent is Agent B (Wolf)
-    # When Agent A is initialized for the first time, Agent B might not exist as a model yet.
+    # Lambdas for training_env_lambda should now return the base DnDCombatEnv,
+    # which will be wrapped by FlattenObservation then DummyVecEnv inside initialize_model or before .learn()
+
+    print(f"\nInitializing Agent 1 ({args.agent1_stats_module.split('.')[-1]})...")
+    training_env_lambda_a_init = lambda: FlattenObservation(make_training_env(
+        is_training_agent_a=True,
+        opponent_model_path=(args.model_b_path if os.path.exists(args.model_b_path) else None),
+        current_iteration=0,
+        training_agent_name="Init_Agent1_vs_Agent2",
+        agent1_stats=agent1_stats_data,
+        agent2_stats=agent2_stats_data
+    ))
     model_a = initialize_model(
         model_path=args.model_a_path,
         is_agent_a_being_initialized=True, 
         dqn_hparams=dqn_hyperparameters,
-        initial_opponent_model_path=args.model_b_path if os.path.exists(args.model_b_path) else None, # Use existing B if available
-        training_env_lambda=lambda: make_training_env(True, (args.model_b_path if os.path.exists(args.model_b_path) else None), 0, "Init_A_vs_B")
+        initial_opponent_model_path=args.model_b_path if os.path.exists(args.model_b_path) else None,
+        training_env_lambda=training_env_lambda_a_init
     )
 
-    print("\nInitializing Agent B (Wolf)...")
-    # For Agent B (Wolf), its opponent is Agent A (Commoner)
+    print(f"\nInitializing Agent 2 ({args.agent2_stats_module.split('.')[-1]})...")
+    training_env_lambda_b_init = lambda: FlattenObservation(make_training_env(
+        is_training_agent_a=False,
+        opponent_model_path=(args.model_a_path if os.path.exists(args.model_a_path) else None),
+        current_iteration=0,
+        training_agent_name="Init_Agent2_vs_Agent1",
+        agent1_stats=agent1_stats_data,
+        agent2_stats=agent2_stats_data
+    ))
     model_b = initialize_model(
         model_path=args.model_b_path,
         is_agent_a_being_initialized=False, 
         dqn_hparams=dqn_hyperparameters,
-        initial_opponent_model_path=args.model_a_path if os.path.exists(args.model_a_path) else None, # Use existing A if available
-        training_env_lambda=lambda: make_training_env(False, (args.model_a_path if os.path.exists(args.model_a_path) else None), 0, "Init_B_vs_A")
+        initial_opponent_model_path=args.model_a_path if os.path.exists(args.model_a_path) else None,
+        training_env_lambda=training_env_lambda_b_init
     )
 
     # --- Main Alternating Training Loop ---
@@ -190,26 +264,29 @@ if __name__ == '__main__':
         iteration_num = i + 1
         print(f"\n===== Iteration {iteration_num}/{args.iterations} =====")
 
-        # --- Train Agent A (Commoner) against current Agent B ---
-        agent_a_log_name = f"AgentA_Commoner_Iter{iteration_num}"
-        print(f"\nTraining {agent_a_log_name} (Agent A) against current Agent B ({args.model_b_path})...")
+        # --- Train Agent A (Agent 1) against current Agent B (Agent 2) ---
+        agent_a_creature_name = args.agent1_stats_module.split('.')[-1]
+        agent_a_log_name = f"Agent1_{agent_a_creature_name}_Iter{iteration_num}"
+        print(f"\nTraining {agent_a_log_name} (Agent 1) against current Agent 2 ({args.model_b_path})...")
         
         opponent_b_model_to_use = args.model_b_path if os.path.exists(args.model_b_path) else None
         if opponent_b_model_to_use:
-             print(f"Agent A will train against loaded Agent B model: {opponent_b_model_to_use}")
+             print(f"Agent 1 will train against loaded Agent 2 model: {opponent_b_model_to_use}")
         else:
-             print(f"Agent A will train against rule-based Agent B (Wolf) as {args.model_b_path} not found or not yet trained.")
+             print(f"Agent 1 will train against rule-based Agent 2 ({args.agent2_stats_module.split('.')[-1]}) as {args.model_b_path} not found or not yet trained.")
 
-        env_a_lambda = lambda: make_training_env(
+        # Lambda now returns the base environment, to be wrapped
+        env_a_base_lambda = lambda: make_training_env(
             is_training_agent_a=True, 
             opponent_model_path=opponent_b_model_to_use,
             current_iteration=iteration_num,
-            training_agent_name=agent_a_log_name
+            training_agent_name=agent_a_log_name,
+            agent1_stats=agent1_stats_data,
+            agent2_stats=agent2_stats_data
         )
-        vec_env_a = DummyVecEnv([env_a_lambda])
+        vec_env_a = DummyVecEnv([lambda: FlattenObservation(env_a_base_lambda())])
         
-        model_a.set_env(vec_env_a) # Use vec_env_a now
-        # Ensure tensorboard_log path is correctly formatted and unique per agent and iteration
+        model_a.set_env(vec_env_a)
         model_a.tensorboard_log = os.path.join(LOG_DIR_BASE, agent_a_log_name)
         os.makedirs(model_a.tensorboard_log, exist_ok=True)
 
@@ -222,22 +299,25 @@ if __name__ == '__main__':
         print(f"{agent_a_log_name} trained and saved to {args.model_a_path}")
         vec_env_a.close()
 
-        # --- Train Agent B (Wolf) against updated Agent A ---
-        agent_b_log_name = f"AgentB_Wolf_Iter{iteration_num}"
-        print(f"\nTraining {agent_b_log_name} (Agent B) against updated Agent A ({args.model_a_path})...")
+        # --- Train Agent B (Agent 2) against updated Agent A (Agent 1) ---
+        agent_b_creature_name = args.agent2_stats_module.split('.')[-1]
+        agent_b_log_name = f"Agent2_{agent_b_creature_name}_Iter{iteration_num}"
+        print(f"\nTraining {agent_b_log_name} (Agent 2) against updated Agent 1 ({args.model_a_path})...")
 
-        opponent_a_model_to_use = args.model_a_path # Agent A's model should exist now
-        print(f"Agent B will train against loaded Agent A model: {opponent_a_model_to_use}")
+        opponent_a_model_to_use = args.model_a_path # Agent 1's model should exist now
+        print(f"Agent 2 will train against loaded Agent 1 model: {opponent_a_model_to_use}")
 
-        env_b_lambda = lambda: make_training_env(
+        env_b_base_lambda = lambda: make_training_env(
             is_training_agent_a=False, 
             opponent_model_path=opponent_a_model_to_use,
             current_iteration=iteration_num,
-            training_agent_name=agent_b_log_name
+            training_agent_name=agent_b_log_name,
+            agent1_stats=agent1_stats_data,
+            agent2_stats=agent2_stats_data
         )
-        vec_env_b = DummyVecEnv([env_b_lambda])
+        vec_env_b = DummyVecEnv([lambda: FlattenObservation(env_b_base_lambda())])
 
-        model_b.set_env(vec_env_b) # Use vec_env_b now
+        model_b.set_env(vec_env_b)
         model_b.tensorboard_log = os.path.join(LOG_DIR_BASE, agent_b_log_name)
         os.makedirs(model_b.tensorboard_log, exist_ok=True)
         
@@ -251,7 +331,7 @@ if __name__ == '__main__':
         vec_env_b.close()
 
     print("\n--- Alternating Self-Play Training Complete ---")
-    print(f"Final Agent A (Commoner) model saved to: {args.model_a_path}")
-    print(f"Final Agent B (Wolf) model saved to: {args.model_b_path}")
+    print(f"Final Agent 1 ({args.agent1_stats_module.split('.')[-1]}) model saved to: {args.model_a_path}")
+    print(f"Final Agent 2 ({args.agent2_stats_module.split('.')[-1]}) model saved to: {args.model_b_path}")
     print(f"TensorBoard logs saved in directory: {os.path.abspath(LOG_DIR_BASE)}")
     print(f"To view logs: tensorboard --logdir=\"{os.path.abspath(LOG_DIR_BASE)}\"")
