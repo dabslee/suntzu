@@ -522,8 +522,8 @@ class DnDCombatEnv(gym.Env):
 
             # Agent survival reward for this turn (if action didn't end episode)
             # (The 'if not action_taken_successfully: pass' block was removed as it was neutral)
-            if self.agent.is_alive and not terminated:
-                reward += 0.1
+            # if self.agent.is_alive and not terminated:
+            #     reward += 0.5
 
         # If agent's action caused termination (e.g. enemy defeated by agent's attack)
         if terminated:

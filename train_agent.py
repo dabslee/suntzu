@@ -20,6 +20,7 @@ MAP_WIDTH = 10
 MAP_HEIGHT = 10
 
 LOG_DIR = "./dnd_dqn_tensorboard/"
+MODEL_SAVE_PATH = "dnd_dqn_agent.zip"
 
 # Ensure log directory exists
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -48,10 +49,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train DQN Agent for D&D Combat Environment.")
     parser.add_argument("--enemy_model_path", type=str, default=None,
                         help="Path to a pre-trained DQN model for the enemy. If None, rule-based AI is used.")
-    parser.add_argument("--model_save_path", type=str, default=None,
-                        help="Path to save resulting model.")
+    # Potentially add other CLI args like total_timesteps, model_save_path, log_dir etc.
     args = parser.parse_args()
-    MODEL_SAVE_PATH = args.model_save_path
 
     if args.enemy_model_path:
         print(f"Attempting to train agent against an enemy controlled by model: {args.enemy_model_path}")
@@ -87,8 +86,8 @@ if __name__ == "__main__":
     print("DQN model defined.")
 
     # --- Training ---
-    # TOTAL_TIMESTEPS = 50000 # Reduced for quicker initial testing (plan was 200k)
-    TOTAL_TIMESTEPS = 1000 # Even shorter for a very quick smoke test
+    TOTAL_TIMESTEPS = 50000 # Reduced for quicker initial testing (plan was 200k)
+    # TOTAL_TIMESTEPS = 1000 # Even shorter for a very quick smoke test
     print(f"Starting training for {TOTAL_TIMESTEPS} timesteps...")
     
     model.learn(

@@ -165,6 +165,7 @@ if __name__ == '__main__':
     # Current main signature: main(agent_type: str, export_frames_path_arg: Optional[str])
     # We will map the new args to the old main signature for now.
     # This will be properly fixed in the next subtask.
+    agent_type_for_main = "trained" if args.agent_control == "model" else "random"
     main(
         agent_control_arg=args.agent_control,
         agent_model_path_arg=args.agent_model_path,
