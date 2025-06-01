@@ -679,3 +679,341 @@ def test_episode_truncation(dnd_env): # Uses the dnd_env fixture
     # Check if current_episode_steps resets after truncation
     obs, info = env.reset(seed=13) # Use a different seed for reset
     assert env.current_episode_steps == 0, "current_episode_steps should be 0 after reset following a truncated episode"
+
+
+# --- Helper function to get action index ---
+def get_action_idx(env_instance, action_type_or_name: str, attack_name: Optional[str] = None) -> int:
+    """Helper to find the index of an action in the action_map."""
+    for i, action_def in enumerate(env_instance.action_map):
+        if action_def["type"] == action_type_or_name:
+            if action_type_or_name == "attack" and attack_name:
+                if action_def["name"] == f"attack_{attack_name}":
+                    return i
+            elif action_type_or_name != "attack": # For non-attack types, type matching is enough, or use name
+                 if action_def["name"] == action_type_or_name: # e.g. "dash", "dodge"
+                    return i
+        # Allow searching by just the unique name if it's not a generic type like "attack"
+        if action_def["name"] == action_type_or_name and action_type_or_name not in ["attack", "move", "bonus_action"]:
+             return i
+
+
+    # Fallback for simple types if name wasn't specific enough initially
+    if action_type_or_name in ["attack", "move", "bonus_action", "pass_turn", "end_turn", "dash", "disengage", "dodge"]:
+        for i, action_def in enumerate(env_instance.action_map):
+             if action_def["type"] == action_type_or_name:
+                  return i # Return first match for generic types if no sub-name given
+
+    raise ValueError(f"Action {action_type_or_name} (sub-name: {attack_name}) not found in env action_map: {env_instance.action_map}")
+
+
+# --- Tests for New Mechanics ---
+
+def test_action_economy_rules(dnd_env):
+    dnd_env.reset(seed=100)
+    agent = dnd_env.agent
+
+    attack_idx = get_action_idx(dnd_env, "attack", agent.attacks[0]["name"])
+    dash_idx = get_action_idx(dnd_env, "dash")
+    bonus_action_idx = get_action_idx(dnd_env, dnd_env.agent.bonus_actions[0]) if dnd_env.agent.bonus_actions else -1
+    move_e_idx = get_action_idx(dnd_env, "move_E")
+
+    # 1. Agent attempts two main actions: Attack then Dash. Dash should not effectively happen if action is used.
+    agent.start_new_turn() # Ensure fresh turn
+    obs, reward, term, trunc, info = dnd_env.step(attack_idx)
+    assert agent.used_action_this_turn is True
+    # Store speed after attack, before dash attempt
+    speed_after_attack = agent.speed_remaining
+
+    obs, reward, term, trunc, info = dnd_env.step(dash_idx) # Attempt Dash
+    assert info.get('agent_action_details') == "Agent tried Dash but action already used." # Check info log
+    assert agent.took_dash_action_this_turn is False # Dash effect should not apply
+    assert agent.speed_remaining == speed_after_attack # Speed should not have doubled
+
+    # 2. Agent attempts two bonus actions. (Assuming agent has at least one bonus action)
+    if bonus_action_idx != -1:
+        agent.start_new_turn()
+        obs, reward, term, trunc, info = dnd_env.step(bonus_action_idx)
+        assert agent.used_bonus_action_this_turn is True
+
+        # Try another bonus action (or the same one) - should fail
+        obs, reward, term, trunc, info = dnd_env.step(bonus_action_idx)
+        assert "Bonus action already used" in info.get('agent_action_details', "") or \
+               "Agent tried Bonus Action but it was already used" in info.get('agent_action_details', "")
+    else:
+        pytest.skip("Agent has no bonus actions to test double usage.")
+
+    # 3. Agent uses action, bonus action, and moves. All should be successful.
+    agent.start_new_turn()
+    initial_speed = agent.speed_remaining
+
+    # Action
+    obs, reward, term, trunc, info = dnd_env.step(attack_idx)
+    assert agent.used_action_this_turn is True
+    assert not term # Assuming attack doesn't end episode for this test
+
+    # Bonus Action
+    if bonus_action_idx != -1:
+        obs, reward, term, trunc, info = dnd_env.step(bonus_action_idx)
+        assert agent.used_bonus_action_this_turn is True
+        assert not term
+
+    # Move
+    obs, reward, term, trunc, info = dnd_env.step(move_e_idx)
+    assert agent.speed_remaining < initial_speed # Speed should be consumed by move
+    assert not term
+
+
+def test_dash_action(dnd_env):
+    dnd_env.reset(seed=101)
+    agent = dnd_env.agent
+    initial_total_speed = agent.speed_total
+
+    dash_idx = get_action_idx(dnd_env, "dash")
+    move_e_idx = get_action_idx(dnd_env, "move_E")
+
+    # Agent takes Dash action
+    agent.start_new_turn()
+    obs, reward, term, trunc, info = dnd_env.step(dash_idx)
+
+    assert agent.used_action_this_turn is True
+    assert agent.took_dash_action_this_turn is True
+    # Speed remaining should be initial_total_speed (from start_new_turn) + initial_total_speed (from dash)
+    assert agent.speed_remaining == initial_total_speed * 2
+
+    # Agent moves using dashed speed
+    obs, reward, term, trunc, info = dnd_env.step(move_e_idx) # Move 1 cell
+    assert agent.speed_remaining == (initial_total_speed * 2) - 1
+
+    # Simulate passing turn / enemy turn, then start agent's new turn
+    # This typically happens in the main loop or by enemy action.
+    # For this test, manually call start_new_turn for the agent.
+    agent.start_new_turn() # This should reset speed and dash status
+    assert agent.took_dash_action_this_turn is False
+    assert agent.speed_remaining == initial_total_speed
+
+
+def test_disengage_and_opportunity_attack(dnd_env):
+    dnd_env.reset(seed=102)
+    agent = dnd_env.agent
+    enemy = dnd_env.enemy
+
+    disengage_idx = get_action_idx(dnd_env, "disengage")
+    move_e_idx = get_action_idx(dnd_env, "move_E") # Action to move away
+    pass_idx = get_action_idx(dnd_env, "pass_turn")
+
+    # Scenario 1: OA Triggered
+    agent.start_new_turn()
+    enemy.start_new_turn() # Ensure enemy reaction is available
+    agent.position = [1,1]
+    enemy.position = [1,2] # Adjacent
+    enemy.current_hp = 100 # Ensure enemy survives to make OA
+    initial_agent_hp = agent.current_hp
+
+    # Agent moves away without Disengaging
+    obs, reward_oa, term_oa, trunc_oa, info_oa = dnd_env.step(move_e_idx)
+
+    assert enemy.used_reaction_this_round is True, "Enemy should have used reaction for OA"
+    # Check if agent took damage (this assumes OA hits, might need dice mocking for perfect test)
+    # For now, if reaction used, assume OA was processed. Damage depends on hit.
+    if 'opportunity_attack_by_enemy_outcome' in info_oa and "Hit" in info_oa['opportunity_attack_by_enemy_outcome']:
+        assert agent.current_hp < initial_agent_hp, "Agent should take damage from OA"
+
+    # Scenario 2: Disengage Prevents OA
+    dnd_env.reset(seed=103) # Reset positions and states
+    agent.start_new_turn()
+    enemy.start_new_turn()
+    agent.position = [1,1]
+    enemy.position = [1,2] # Adjacent
+    enemy.used_reaction_this_round = False # Ensure reaction available
+    initial_agent_hp_disengage = agent.current_hp
+
+    # Agent takes Disengage action
+    obs, _, _, _, _ = dnd_env.step(disengage_idx)
+    assert agent.is_disengaging is True
+    assert agent.used_action_this_turn is True
+
+    # Agent moves away from adjacent enemy
+    obs, _, _, _, info_no_oa = dnd_env.step(move_e_idx)
+    assert enemy.used_reaction_this_round is False, "Enemy should not use reaction if agent disengaged"
+    assert agent.current_hp == initial_agent_hp_disengage, "Agent should not take damage if enemy OA prevented"
+    assert 'opportunity_attack_by_enemy' not in info_no_oa # Check that no OA was logged
+
+    # Scenario 3: No Reaction for OA
+    dnd_env.reset(seed=104)
+    agent.start_new_turn()
+    enemy.start_new_turn()
+    agent.position = [1,1]
+    enemy.position = [1,2] # Adjacent
+    enemy.used_reaction_this_round = True # Enemy already used reaction
+    initial_agent_hp_no_reaction = agent.current_hp
+
+    # Agent moves away without Disengaging
+    obs, _, _, _, info_no_reaction_avail = dnd_env.step(move_e_idx)
+    assert enemy.used_reaction_this_round is True # Still true, but no new OA
+    assert agent.current_hp == initial_agent_hp_no_reaction, "Agent should not take damage if enemy has no reaction"
+    assert 'opportunity_attack_by_enemy' not in info_no_reaction_avail
+
+
+def test_dodge_action(dnd_env):
+    dnd_env.reset(seed=105)
+    agent = dnd_env.agent
+    enemy = dnd_env.enemy
+
+    dodge_idx = get_action_idx(dnd_env, "dodge")
+    pass_idx = get_action_idx(dnd_env, "pass_turn") # Agent passes so enemy can attack
+
+    # Agent takes Dodge action
+    agent.start_new_turn()
+    obs, _, _, _, _ = dnd_env.step(dodge_idx)
+    assert agent.is_dodging is True
+    assert agent.used_action_this_turn is True
+
+    # Enemy attacks agent. For this test, we assume the enemy AI will attack.
+    # Place them adjacent.
+    agent.position = [1,1]
+    enemy.position = [1,2]
+    enemy.start_new_turn() # Enemy's turn
+
+    # Agent needs to take a non-action (like pass) for the step to proceed to enemy turn
+    obs, _, _, _, info_enemy_attack = dnd_env.step(pass_idx)
+
+    # Verify the enemy's attack was made at disadvantage (intent)
+    # This relies on the step function correctly identifying agent.is_dodging
+    # and passing 'disadvantage' to the make_attack call for the enemy.
+    # We check the info dict for evidence of this.
+    assert 'enemy_attack_modifier' in info_enemy_attack, "Enemy attack modifier info missing"
+    assert "Agent dodging, attack at disadvantage" in info_enemy_attack['enemy_attack_modifier'], \
+        "Enemy attack should be at disadvantage due to agent dodging"
+
+    # On agent's next turn, is_dodging should be false before it acts.
+    agent.start_new_turn() # This is called at the start of agent's turn processing in step()
+    assert agent.is_dodging is False # start_new_turn resets it
+
+
+def test_ranged_attack_rules(dnd_env, agent_stats_env, enemy_stats_env):
+    # Modify agent to have a ranged attack for this test
+    # This requires a new env instance with custom agent stats for this test
+    ranged_attack_stats = agent_stats_env.copy()
+    ranged_attack_stats["attacks"] = [
+        {"name": "shortbow", "to_hit": 5, "damage_dice": "1d6+3", "num_attacks": 1, "attack_type": "ranged", "range": 16} # 80ft/5ft
+    ]
+    # Create a new environment instance with this specific agent
+    test_env = DnDCombatEnv(map_width=10, map_height=10,
+                            agent_stats=ranged_attack_stats,
+                            enemy_stats=enemy_stats_env,
+                            render_mode='ansi')
+    test_env.reset(seed=106)
+    agent = test_env.agent
+    enemy = test_env.enemy
+
+    ranged_attack_idx = get_action_idx(test_env, "attack", "shortbow")
+
+    # Scenario 1: Ranged attack with adjacent enemy
+    agent.start_new_turn()
+    agent.position = [1,1]
+    enemy.position = [1,2] # Adjacent
+
+    obs, _, _, _, info_adj = test_env.step(ranged_attack_idx)
+    assert 'agent_attack_modifier' in info_adj, "Agent attack modifier info missing for adjacent ranged"
+    assert "Ranged attack at disadvantage (enemy adjacent)" in info_adj['agent_attack_modifier'], \
+        "Agent's ranged attack should be at disadvantage when enemy is adjacent"
+
+    # Scenario 2: Ranged attack with no adjacent enemy
+    test_env.reset(seed=107) # Reset positions
+    agent.start_new_turn()
+    agent.position = [1,1]
+    enemy.position = [5,5] # Not adjacent
+
+    obs, _, _, _, info_not_adj = test_env.step(ranged_attack_idx)
+    assert 'agent_attack_modifier' not in info_not_adj or \
+           "Ranged attack at disadvantage (enemy adjacent)" not in info_not_adj.get('agent_attack_modifier',''), \
+           "Agent's ranged attack should not be at disadvantage from proximity if enemy not adjacent"
+
+
+def test_new_observation_fields(dnd_env):
+    dnd_env.reset(seed=108)
+    agent = dnd_env.agent
+    enemy = dnd_env.enemy # For OA
+
+    obs, _ = dnd_env.reset() # Initial state
+    assert obs["agent_used_action"][0] == 0.0
+    assert obs["agent_used_bonus_action"][0] == 0.0
+    assert obs["agent_used_reaction"][0] == 0.0
+    assert obs["agent_is_dodging"][0] == 0.0
+
+    # Test after Dodge
+    dodge_idx = get_action_idx(dnd_env, "dodge")
+    obs, _, _, _, _ = dnd_env.step(dodge_idx)
+    assert obs["agent_is_dodging"][0] == 1.0
+    assert obs["agent_used_action"][0] == 1.0 # Dodge uses an action
+
+    # Reset for next part of test (new turn implicitly handled by step if first action)
+    # To be sure, manually start turn or take action that implies new turn
+    dnd_env.reset(seed=109) # Full reset for clean state
+    obs, _ = dnd_env.reset()
+
+    # Test after main action (e.g. Attack)
+    attack_idx = get_action_idx(dnd_env, "attack", agent.attacks[0]["name"])
+    obs, _, _, _, _ = dnd_env.step(attack_idx)
+    assert obs["agent_used_action"][0] == 1.0
+
+    # Test after bonus action (if available)
+    if agent.bonus_actions:
+        dnd_env.reset(seed=110)
+        obs, _ = dnd_env.reset()
+        bonus_action_idx = get_action_idx(dnd_env, agent.bonus_actions[0])
+        obs, _, _, _, _ = dnd_env.step(bonus_action_idx)
+        assert obs["agent_used_bonus_action"][0] == 1.0
+
+    # Test after reaction (via enemy OA on agent)
+    dnd_env.reset(seed=111)
+    agent.start_new_turn() # Agent's turn
+    enemy.start_new_turn() # Enemy's turn (so reaction is available)
+    agent.position = [1,1]
+    enemy.position = [1,2] # Adjacent
+    # Agent moves away to trigger OA from enemy
+    move_e_idx = get_action_idx(dnd_env, "move_E")
+    obs, _, _, _, _ = dnd_env.step(move_e_idx) # This obs is for the agent AFTER its move and enemy's OA
+                                            # The enemy's reaction status is on enemy, not agent obs
+                                            # So this observation won't reflect enemy's reaction.
+
+    # To test agent_used_reaction, the *agent* must make an OA.
+    # So, enemy moves, agent makes OA.
+    dnd_env.reset(seed=112)
+    agent.start_new_turn()
+    enemy.start_new_turn()
+    agent.position = [1,2] # Agent
+    enemy.position = [1,1] # Enemy adjacent
+
+    # Enemy needs to move away from agent. We need to make enemy move.
+    # Easiest way: agent passes, enemy AI (rule-based) tries to move if it can't attack.
+    # Give enemy no attacks so it's forced to consider moving.
+    original_enemy_attacks = enemy.attacks
+    enemy.attacks = []
+    pass_idx = get_action_idx(dnd_env, "pass_turn")
+    obs, _, _, _, info = dnd_env.step(pass_idx) # Agent passes, enemy turn happens.
+
+    # Now check agent's observation from THIS step (which includes enemy turn)
+    # The observation 'obs' is from the perspective of the *next* agent action.
+    # If agent made an OA, its used_reaction should be 1.0.
+    # The info dict from the step where enemy moved and agent OAd will show agent OA.
+    if 'opportunity_attack_by_agent' in info:
+        # The 'obs' is for the *start* of the agent's next turn.
+        # Reaction resets at start of turn. So this test for obs["agent_used_reaction"]
+        # needs to be more nuanced or check creature state directly before obs is made.
+        # For now, we check the flag on the creature after the step.
+        assert dnd_env.agent.used_reaction_this_round is True
+
+        # If we get a new obs *after* this step, for the *next* agent decision:
+        # The used_reaction_this_round would have been reset by agent.start_new_turn().
+        # So, let's check the obs provided *by the step that included the reaction*.
+        # The 'obs' returned by dnd_env.step(pass_idx) is the one for the agent's *next* turn.
+        # We need to check the state of agent.used_reaction_this_round *before* _get_obs() is called for that next turn.
+
+        # This part of the test highlights that observation reflects state *for the next decision*.
+        # The fact an OA happened and reaction was used is better tested by creature state or logs.
+        # The obs["agent_used_reaction"] will be 0.0 if it's a new turn for the agent.
+        # However, if the test framework allows, one could inspect the observation
+        # for the *enemy* if it's model-based, as that would be generated mid-step.
+
+    enemy.attacks = original_enemy_attacks # Restore

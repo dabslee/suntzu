@@ -11,29 +11,59 @@ def roll(dice_string: str) -> int:
     Returns:
         The total result of the dice roll.
     """
-    # Use fullmatch to ensure the entire string conforms to the pattern
-    pattern = re.compile(r"(\d*)d(\d+)(?:([+-])(\d+))?")
+    # New pattern: r"(\d*)d(\d+)(?:(kh|kl)(\d+))?(?:([+-])(\d+))?"
+    # Groups:
+    # 1: num_dice_str
+    # 2: dice_type_str
+    # 3: keep_instr (kh or kl)
+    # 4: keep_count_str
+    # 5: modifier_sign (+ or -)
+    # 6: modifier_val_str
+    pattern = re.compile(r"(\d*)d(\d+)(?:(kh|kl)(\d+))?(?:([+-])(\d+))?")
     match = pattern.fullmatch(dice_string)
 
     if not match:
-        # If the full string doesn't match the dice pattern,
-        # try to interpret it as a simple integer.
-        # Allow "3" or "-3". Strings starting with "+" (e.g., "+5")
-        # and not part of d-notation are considered invalid.
-        if re.fullmatch(r"-?\d+", dice_string):  # Matches integers like "3", "-3"
+        if re.fullmatch(r"-?\d+", dice_string):
             return int(dice_string)
         else:
-            # This will catch "+5" and other non-dice, non-simple-integer strings
             raise ValueError(f"Invalid dice string: {dice_string}")
 
-    num_dice_str, dice_type_str, modifier_sign, modifier_val_str = match.groups()
+    num_dice_str, dice_type_str, keep_instr, keep_count_str, modifier_sign, modifier_val_str = match.groups()
 
     num_dice = int(num_dice_str) if num_dice_str else 1
     dice_type = int(dice_type_str)
 
+    if dice_type <= 0:
+        raise ValueError("Dice type must be positive.")
+    if num_dice < 0:
+        raise ValueError("Number of dice cannot be negative.")
+
     total_roll = 0
-    for _ in range(num_dice):
-        total_roll += random.randint(1, dice_type)
+
+    if keep_instr and keep_count_str:
+        keep_count = int(keep_count_str)
+        if keep_count <= 0:
+            raise ValueError("Keep count must be positive.")
+        if keep_count > num_dice:
+            raise ValueError(f"Cannot keep {keep_count} dice from {num_dice} dice.")
+
+        rolls = []
+        for _ in range(num_dice):
+            rolls.append(random.randint(1, dice_type))
+
+        if keep_instr == "kh":
+            rolls.sort(reverse=True)
+        elif keep_instr == "kl":
+            rolls.sort()
+
+        total_roll = sum(rolls[:keep_count])
+    else:
+        # Standard roll
+        if num_dice == 0:
+            total_roll = 0 # 0d6 = 0
+        else:
+            for _ in range(num_dice):
+                total_roll += random.randint(1, dice_type)
 
     if modifier_sign and modifier_val_str:
         modifier_val = int(modifier_val_str)
