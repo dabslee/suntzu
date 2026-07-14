@@ -193,9 +193,10 @@ class DnDCombatEnv(gym.Env):
         self.map_height = map_height
         self.grid_size = grid_size 
         
-        self.max_episode_steps = 100 
-        self.current_episode_steps = 0 
-        self.current_episode_num = 0 
+        self.max_episode_steps = 100
+        self.current_episode_steps = 0
+        self.current_episode_num = 0
+        self.agent_micro_steps_this_turn = 0
 
         self.render_mode = render_mode
         self.export_frames_path = export_frames_path
@@ -407,10 +408,9 @@ class DnDCombatEnv(gym.Env):
         self.agent.reset(initial_position=agent_start_pos)
         self.enemy.reset(initial_position=enemy_start_pos)
         
-        # Reset turn-specific states (e.g. if bonus actions were once per turn)
-        # self.bonus_action_used_this_turn = False 
         self.current_episode_steps = 0 # Reset step counter for the new episode
         self.current_episode_num += 1 # Increment episode number
+        self.agent_micro_steps_this_turn = 0
 
         return self._get_obs(), self._get_info()
 
@@ -455,8 +455,7 @@ class DnDCombatEnv(gym.Env):
         action_map.append({"type": "disengage", "name": "disengage"})
         action_map.append({"type": "dodge", "name": "dodge"})
 
-        # 5. Pass / End Turn action
-        action_map.append({"type": "pass_turn", "name": "pass_turn"})
+        # 5. End Turn action (hands the round over to the opponent)
         action_map.append({"type": "end_turn", "name": "end_turn"})
 
         return action_map
@@ -473,6 +472,11 @@ class DnDCombatEnv(gym.Env):
             # print(f"DEBUG: Decoding agent action using agent_action_map. Action int: {action_int}, Map size: {len(map_to_use)}")
 
         if not (0 <= action_int < len(map_to_use)):
+            if is_enemy:
+                # An enemy model trained against a different action space may
+                # predict an id we don't have; treat it as a pass instead of
+                # crashing the episode.
+                return {"type": "pass", "name": f"pass_invalid_action_id_{action_int}"}
             actor_type = "enemy" if is_enemy else "agent"
             map_type_used = "enemy_specific_map" if (is_enemy and self.enemy_is_model_controlled and self._enemy_action_map_for_validation is not None) else "agent_map"
 
@@ -518,504 +522,294 @@ class DnDCombatEnv(gym.Env):
         
         return action_details
 
-    def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
-        self.current_episode_steps += 1 # Increment step counter
-        info = {} # Initialize info dictionary
+    def _first_melee_attack_index(self, creature: Creature) -> int:
+        for i, attack in enumerate(creature.attacks):
+            if attack.get("attack_type", "melee") == "melee":
+                return i
+        return -1
 
+    def _turn_economy_exhausted(self, creature: Creature) -> bool:
+        """True when the creature has nothing meaningful left to do this turn."""
+        bonus_done = creature.used_bonus_action_this_turn or not creature.bonus_actions
+        return creature.used_action_this_turn and bonus_done and creature.speed_remaining <= 0
+
+    def _max_micro_steps(self, creature: Creature) -> int:
+        # Enough for a full Dash turn (2x speed in single-cell moves) plus an
+        # action, a bonus action, and some slack. Bounds turn length so a
+        # policy repeating invalid actions cannot stall the round forever.
+        return 2 * creature.speed_total + 3
+
+    def _execute_micro_action(self, actor: Creature, target: Creature,
+                              decoded_action: Dict[str, Any], info: Dict[str, Any],
+                              prefix: str) -> Tuple[float, bool, bool]:
+        """Execute a single micro-action for `actor` against `target`.
+
+        Shared by the agent and the (model- or rule-controlled) enemy so both
+        sides play by identical rules. Rewards are always from the agent's
+        perspective. Returns (reward_delta, terminated, action_succeeded).
+        """
+        is_agent = actor is self.agent
+        other_prefix = "enemy" if is_agent else "agent"
+        reward_delta = 0.0
         terminated = False
-        truncated = False 
-        reward = -0.1  # Overall step penalty
+        success = False
+        action_type = decoded_action["type"]
+
+        if action_type == "move":
+            dx, dy = decoded_action["delta"]
+            cost = abs(dx) + abs(dy)
+            if actor.speed_remaining < cost:
+                info[f'{prefix}_move_outcome'] = "Not enough speed."
+            else:
+                target_x = actor.position[0] + dx
+                target_y = actor.position[1] + dy
+                if not self._is_valid_position(target_x, target_y):
+                    info[f'{prefix}_move_outcome'] = "Move out of bounds."
+                elif [target_x, target_y] == target.position and target.is_alive:
+                    info[f'{prefix}_move_outcome'] = f"Blocked by {other_prefix}."
+                else:
+                    # The move is definitely happening; resolve an opportunity
+                    # attack first if the actor is leaving the target's reach.
+                    if target.can_act() and \
+                       self._calculate_manhattan_distance(actor.position, target.position) == 1 and \
+                       self._calculate_manhattan_distance([target_x, target_y], target.position) > 1 and \
+                       not actor.is_disengaging and \
+                       not target.used_reaction_this_round:
+                        melee_idx = self._first_melee_attack_index(target)
+                        if melee_idx != -1:
+                            info[f'opportunity_attack_by_{other_prefix}'] = (
+                                f"{other_prefix.capitalize()} opportunity attack from {target.position} "
+                                f"as {prefix} moves from {actor.position} to {[target_x, target_y]}")
+                            hp_before = actor.current_hp
+                            hit, _ = target.make_attack(actor, melee_idx, self.dice_roller,
+                                                        advantage_disadvantage=None)
+                            target.used_reaction_this_round = True
+                            damage = hp_before - actor.current_hp
+                            if hit:
+                                reward_delta += -damage if is_agent else damage
+                                info[f'opportunity_attack_by_{other_prefix}_outcome'] = f"Hit, dealt {damage} damage."
+                            else:
+                                info[f'opportunity_attack_by_{other_prefix}_outcome'] = "Miss."
+                            if not actor.is_alive:
+                                terminated = True
+                                reward_delta += -100 if is_agent else 100
+                                info['combat_outcome'] = ("Agent died to Opportunity Attack" if is_agent
+                                                          else "Enemy died to Opportunity Attack")
+                                return reward_delta, terminated, False
+                    if actor.move(dx, dy, self.map_width, self.map_height):
+                        success = True
+                        info[f'{prefix}_move_outcome'] = f"Moved ({dx},{dy})."
+                    else:
+                        info[f'{prefix}_move_outcome'] = "Move failed unexpectedly."
+
+        elif action_type == "attack":
+            if actor.used_action_this_turn:
+                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} tried Attack but action already used."
+                info[f'{prefix}_attack_outcome'] = "Action already used."
+            else:
+                attack_idx = decoded_action["index"]
+                attack_stats = actor.attacks[attack_idx]
+                attack_name = attack_stats.get("name", f"Attack {attack_idx}")
+                attack_range = attack_stats.get("range", 1)
+                attack_kind = attack_stats.get("attack_type", "melee")
+                distance = self._calculate_manhattan_distance(actor.position, target.position)
+
+                adv_disadv = None
+                if attack_kind == "ranged" and distance <= 1:
+                    adv_disadv = 'disadvantage'
+                    info[f'{prefix}_attack_modifier'] = f"Ranged attack at disadvantage ({other_prefix} adjacent)."
+                if target.is_dodging:
+                    if adv_disadv == 'advantage':
+                        adv_disadv = None
+                        info[f'{prefix}_attack_modifier'] = (info.get(f'{prefix}_attack_modifier', "") +
+                                                             f" {other_prefix.capitalize()} dodging cancels advantage.")
+                    else:
+                        adv_disadv = 'disadvantage'
+                        info[f'{prefix}_attack_modifier'] = (info.get(f'{prefix}_attack_modifier', "") +
+                                                             f" {other_prefix.capitalize()} dodging, attack at disadvantage.")
+
+                info[f'{prefix}_action_details'] = (
+                    f"Attack: {attack_name} (Range: {attack_range}, Type: {attack_kind}, "
+                    f"Adv/Disadv: {adv_disadv}), Target Dist: {distance}")
+
+                if distance <= attack_range:
+                    hp_before = target.current_hp
+                    hit, _ = actor.make_attack(target, attack_idx, self.dice_roller,
+                                               advantage_disadvantage=adv_disadv)
+                    damage = hp_before - target.current_hp
+                    if hit:
+                        reward_delta += damage if is_agent else -damage
+                        info[f'{prefix}_attack_outcome'] = f"Hit, dealt {damage} damage."
+                    else:
+                        info[f'{prefix}_attack_outcome'] = "Miss."
+                    if not target.is_alive:
+                        terminated = True
+                        reward_delta += 100 if is_agent else -100
+                        info['combat_outcome'] = "Agent won" if is_agent else "Enemy won"
+                else:
+                    info[f'{prefix}_attack_outcome'] = "Out of range."
+                actor.used_action_this_turn = True
+                success = True
+
+        elif action_type == "bonus_action":
+            if actor.used_bonus_action_this_turn:
+                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} tried Bonus Action but it was already used."
+                info[f'{prefix}_bonus_outcome'] = "Bonus action already used."
+            else:
+                ba_name = decoded_action["name"]
+                info[f'{prefix}_action_details'] = f"Bonus Action: {ba_name}"
+                if ba_name == "bonus_move_1_cell":
+                    actor.speed_remaining += 1
+                    if is_agent:
+                        reward_delta += 0.02
+                    info[f'{prefix}_bonus_outcome'] = "Used bonus_move_1_cell, gained 1 speed."
+                else:
+                    info[f'{prefix}_bonus_outcome'] = f"Used bonus action: {ba_name} (effect placeholder)."
+                actor.used_bonus_action_this_turn = True
+                success = True
+
+        elif action_type in ("dash", "disengage", "dodge"):
+            if actor.used_action_this_turn:
+                info[f'{prefix}_action_details'] = (f"{prefix.capitalize()} tried {action_type.capitalize()} "
+                                                    f"but action already used.")
+            else:
+                if action_type == "dash":
+                    actor.took_dash_action_this_turn = True
+                    actor.speed_remaining += actor.speed_total
+                elif action_type == "disengage":
+                    actor.is_disengaging = True
+                else:
+                    actor.is_dodging = True
+                actor.used_action_this_turn = True
+                success = True
+                if is_agent:
+                    reward_delta += 0.05
+                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} used {action_type.capitalize()} action."
+
+        elif action_type == "end_turn":
+            success = True
+            info[f'{prefix}_action_details'] = f"{prefix.capitalize()} ended turn."
+
+        elif action_type == "pass":
+            # Fallback from _decode_action for an index this creature doesn't have.
+            info[f'{prefix}_action_details'] = (f"{prefix.capitalize()} chose an action invalid for this "
+                                                f"creature; treated as pass.")
+
+        return reward_delta, terminated, success
+
+    def _run_enemy_turn(self, info: Dict[str, Any]) -> Tuple[float, bool]:
+        """Run the enemy's complete turn. Returns (reward_delta, terminated)."""
+        self.enemy.start_new_turn()
+        if self.enemy_is_model_controlled and self.enemy_model and self.enemy_obs_flattener:
+            return self._run_enemy_model_turn(info)
+        return self._run_enemy_rule_based_turn(info)
+
+    def _run_enemy_model_turn(self, info: Dict[str, Any]) -> Tuple[float, bool]:
+        info['enemy_ai_type'] = 'model_controlled'
+        reward_delta = 0.0
+        terminated = False
+        actions_taken = []
+        for _ in range(self._max_micro_steps(self.enemy)):
+            enemy_obs_dict = self._get_enemy_observation()
+            flat_enemy_obs = self.enemy_obs_flattener.observation(enemy_obs_dict)
+            enemy_action_id_array, _ = self.enemy_model.predict(flat_enemy_obs, deterministic=True)
+            enemy_action_id = int(enemy_action_id_array.item())
+            decoded = self._decode_action(enemy_action_id, is_enemy=True)
+            actions_taken.append(decoded.get("name", str(enemy_action_id)))
+
+            r, terminated, success = self._execute_micro_action(self.enemy, self.agent, decoded, info, 'enemy')
+            reward_delta += r
+            if terminated or decoded["type"] == "end_turn" or self._turn_economy_exhausted(self.enemy):
+                break
+            if not success:
+                # A failed action leaves the observation unchanged, so a
+                # deterministic policy would repeat it forever; end the turn.
+                break
+        info['enemy_action_choice'] = ", ".join(actions_taken)
+        return reward_delta, terminated
+
+    def _run_enemy_rule_based_turn(self, info: Dict[str, Any]) -> Tuple[float, bool]:
+        info['enemy_ai_type'] = 'rule_based'
+        reward_delta = 0.0
+        terminated = False
+        attack_stats = self.enemy.attacks[0] if self.enemy.attacks else None
+        attack_range = attack_stats.get("range", 1) if attack_stats else 1
+
+        # Close distance until within attack range (or adjacent if unarmed).
+        while (not terminated and self.enemy.speed_remaining > 0 and
+               self._calculate_manhattan_distance(self.enemy.position, self.agent.position) > attack_range):
+            diff_x = self.agent.position[0] - self.enemy.position[0]
+            diff_y = self.agent.position[1] - self.enemy.position[1]
+            step_x = (1 if diff_x > 0 else -1, 0) if diff_x != 0 else None
+            step_y = (0, 1 if diff_y > 0 else -1) if diff_y != 0 else None
+            ordered = (step_x, step_y) if abs(diff_x) >= abs(diff_y) else (step_y, step_x)
+            candidate_steps = [s for s in ordered if s is not None]
+
+            moved = False
+            for delta in candidate_steps:
+                decoded = {"type": "move", "delta": delta, "name": f"move({delta[0]},{delta[1]})"}
+                r, terminated, success = self._execute_micro_action(self.enemy, self.agent, decoded, info, 'enemy')
+                reward_delta += r
+                if terminated:
+                    return reward_delta, terminated
+                if success:
+                    moved = True
+                    break
+            if not moved:
+                break  # Boxed in; stop trying to move.
+
+        if (not terminated and attack_stats and not self.enemy.used_action_this_turn and
+                self._calculate_manhattan_distance(self.enemy.position, self.agent.position) <= attack_range):
+            decoded = {"type": "attack", "index": 0,
+                       "name": f"attack_{attack_stats.get('name', '0')}"}
+            r, terminated, _ = self._execute_micro_action(self.enemy, self.agent, decoded, info, 'enemy')
+            reward_delta += r
+
+        return reward_delta, terminated
+
+    def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
+        self.current_episode_steps += 1
+        info: Dict[str, Any] = {}
+        terminated = False
+        truncated = False
+        reward = -0.1  # Flat per-step penalty
 
         decoded_action = self._decode_action(action)
-        info['agent_action'] = decoded_action # Store agent's chosen action type
+        info['agent_action'] = decoded_action
 
-        # Agent's Turn
+        # Agent micro-action. The agent keeps acting across successive step()
+        # calls until it ends its turn (explicitly, by exhausting its action
+        # economy, or by hitting the per-turn micro-step cap); only then does
+        # the enemy take its full turn.
+        agent_turn_over = True
         if self.agent.can_act():
-            # Call start_new_turn() for the agent at the beginning of its action processing.
-            # This is a simplification. In a real game, this would be called once when the agent's turn starts,
-            # not before every single action it might take in a step.
-            # However, given the current structure where step() processes one agent action,
-            # we need to ensure its state is fresh if this is the "first" action of its turn.
-            # A simple proxy: if no action/bonus action used yet, and speed is full, it's start of turn.
-            # This condition might need refinement based on how turns are managed by the calling loop.
-            if not self.agent.used_action_this_turn and \
-               not self.agent.used_bonus_action_this_turn and \
-               self.agent.speed_remaining == self.agent.speed_total:
-                self.agent.start_new_turn()
+            reward_delta, terminated, success = self._execute_micro_action(
+                self.agent, self.enemy, decoded_action, info, 'agent')
+            reward += reward_delta
+            if not success and not terminated and decoded_action["type"] != "end_turn":
+                reward -= 0.05  # Chose an unavailable or invalid action
+            self.agent_micro_steps_this_turn += 1
+            agent_turn_over = (
+                decoded_action["type"] == "end_turn"
+                or self._turn_economy_exhausted(self.agent)
+                or self.agent_micro_steps_this_turn >= self._max_micro_steps(self.agent)
+            )
 
-            action_taken_successfully = False
-            # Note: self.agent.speed_remaining is now managed by start_new_turn and Dash.
-            # The old line `self.agent.speed_remaining = self.agent.speed_total` is removed.
+        # Enemy's full turn, once the agent's turn is over.
+        if not terminated and agent_turn_over and self.enemy.can_act():
+            reward_delta, terminated = self._run_enemy_turn(info)
+            reward += reward_delta
 
-            if decoded_action["type"] == "move":
-                # Movement does not use self.agent.used_action_this_turn
-                dx, dy = decoded_action["delta"]
-                cost_for_this_move_action = abs(dx) + abs(dy) # Cost is based on distance moved
-                
-                if self.agent.speed_remaining >= cost_for_this_move_action:
-                    old_pos = list(self.agent.position)
-                    target_x = self.agent.position[0] + dx
-                    target_y = self.agent.position[1] + dy
+        # Refresh the agent for its next turn so the returned observation
+        # describes the state it will actually decide from.
+        if not terminated and agent_turn_over and self.agent.can_act():
+            self.agent.start_new_turn()
+            self.agent_micro_steps_this_turn = 0
 
-                    # Opportunity Attack Check (Agent Moving)
-                    if self.enemy.can_act() and \
-                       self._calculate_manhattan_distance(old_pos, self.enemy.position) == 1 and \
-                       self._calculate_manhattan_distance([target_x, target_y], self.enemy.position) > 1 and \
-                       not self.agent.is_disengaging and \
-                       not self.enemy.used_reaction_this_round:
-
-                        # Check if enemy has a melee attack
-                        enemy_melee_attack_idx = -1
-                        for i, attack in enumerate(self.enemy.attacks):
-                            if attack.get("attack_type", "melee") == "melee": # Assume melee if not specified
-                                enemy_melee_attack_idx = i
-                                break
-
-                        if enemy_melee_attack_idx != -1:
-                            info['opportunity_attack_by_enemy'] = f"Enemy Opportunity Attack on Agent from {self.enemy.position} to {old_pos} as agent moves to {[target_x, target_y]}"
-                            # Determine adv/disadv for OA (typically None, but consider if target is dodging - agent isn't dodging when it moves)
-                            oa_adv_disadv = None # No advantage/disadvantage for standard OA
-
-                            hit, damage_dealt = self.enemy.make_attack(self.agent, enemy_melee_attack_idx, self.dice_roller, advantage_disadvantage=oa_adv_disadv)
-                            if hit:
-                                reward -= damage_dealt # Negative reward for agent taking damage
-                                info['opportunity_attack_by_enemy_outcome'] = f"Hit, dealt {damage_dealt} damage."
-                            else:
-                                info['opportunity_attack_by_enemy_outcome'] = "Miss."
-                            self.enemy.used_reaction_this_round = True
-                            if not self.agent.is_alive:
-                                terminated = True
-                                info['combat_outcome'] = "Agent died to Opportunity Attack"
-                                # Skip agent's move if killed by OA
-                                return self._get_obs(), reward, terminated, truncated, self._get_info()
-
-                    if not self.agent.is_alive: # Check again if OA killed agent
-                         action_taken_successfully = False # Agent couldn't complete move
-                    elif [target_x, target_y] == self.enemy.position and self.enemy.is_alive:
-                        action_taken_successfully = False
-                        info['agent_move_outcome'] = "Blocked by enemy."
-                    elif self._is_valid_position(target_x, target_y):
-                        if self.agent.move(dx, dy, self.map_width, self.map_height): # move() deducts speed
-                             action_taken_successfully = True
-                             info['agent_move_outcome'] = f"Moved ({dx},{dy})."
-                        else:
-                            action_taken_successfully = False
-                            info['agent_move_outcome'] = "Move failed unexpectedly (e.g. internal speed check failed)."
-                    else:
-                        # Invalid target position (out of bounds)
-                        action_taken_successfully = False
-                        info['agent_move_outcome'] = "Move out of bounds."
-                else:
-                    action_taken_successfully = False # Not enough speed for the move action itself
-                    info['agent_move_outcome'] = "Not enough speed."
-
-            elif decoded_action["type"] == "attack":
-                if not self.agent.used_action_this_turn:
-                    action_taken_successfully = True
-                    attack_idx = decoded_action["index"]
-                    selected_attack_stats = self.agent.attacks[attack_idx]
-                    attack_name = selected_attack_stats.get("name", f"Attack {attack_idx}")
-                    attack_range = selected_attack_stats.get("range", 1)
-                    attack_type = selected_attack_stats.get("attack_type", "melee") # Assume melee if not specified
-                    
-                    adv_disadv_status = None
-                    distance_to_enemy = self._calculate_manhattan_distance(self.agent.position, self.enemy.position)
-
-                    # Ranged Attack Disadvantage
-                    if attack_type == "ranged" and distance_to_enemy <= 1: # Assuming 1 cell is 5ft
-                        adv_disadv_status = 'disadvantage'
-                        info['agent_attack_modifier'] = "Ranged attack at disadvantage (enemy adjacent)."
-
-                    # Dodge Effect on Target
-                    if self.enemy.is_dodging:
-                        if adv_disadv_status == 'advantage': # Advantage and disadvantage cancel
-                            adv_disadv_status = None
-                            info['agent_attack_modifier'] = info.get('agent_attack_modifier', "") + " Enemy dodging cancels advantage."
-                        else: # No advantage, or already disadvantage
-                            adv_disadv_status = 'disadvantage'
-                            info['agent_attack_modifier'] = info.get('agent_attack_modifier', "") + " Enemy dodging, attack at disadvantage."
-
-                    info['agent_action_details'] = f"Attempt Attack: {attack_name} (Range: {attack_range}, Type: {attack_type}, Adv/Disadv: {adv_disadv_status}), Target Dist: {distance_to_enemy}"
-
-                    if distance_to_enemy <= attack_range:
-                        old_enemy_hp = self.enemy.current_hp
-                        # Pass adv_disadv_status to make_attack (implementation of dice rolling with adv/disadv is in make_attack)
-                        hit, _ = self.agent.make_attack(self.enemy, attack_idx, self.dice_roller, advantage_disadvantage=adv_disadv_status)
-                        actual_damage_dealt = old_enemy_hp - self.enemy.current_hp
-
-                        if hit:
-                            reward += actual_damage_dealt
-                            info['agent_attack_outcome'] = f"Hit, dealt {actual_damage_dealt} damage."
-                        else:
-                            info['agent_attack_outcome'] = "Miss."
-
-                        if not self.enemy.is_alive:
-                            reward += 100 # Win reward
-                            terminated = True
-                            info['combat_outcome'] = "Agent won"
-                    else:
-                        info['agent_attack_outcome'] = "Out of range."
-                    self.agent.used_action_this_turn = True
-                else:
-                    action_taken_successfully = False
-                    info['agent_action_details'] = "Agent tried Attack but action already used."
-                    info['agent_attack_outcome'] = "Action already used."
-            
-            elif decoded_action["type"] == "bonus_action":
-                if not self.agent.used_bonus_action_this_turn:
-                    ba_name = decoded_action["name"]
-                    info['agent_action_details'] = f"Attempt Bonus Action: {ba_name}"
-                    # Implement specific bonus action effects here
-                    if ba_name == "bonus_move_1_cell": # Example
-                        self.agent.speed_remaining += 1
-                        reward += 0.02
-                        action_taken_successfully = True
-                        info['agent_bonus_outcome'] = "Used bonus_move_1_cell, gained 1 speed."
-                    # Add other specific bonus actions here if needed
-                    else:
-                        # Generic placeholder for other bonus actions
-                        action_taken_successfully = True
-                        info['agent_bonus_outcome'] = f"Used bonus action: {ba_name} (effect placeholder)."
-
-                    self.agent.used_bonus_action_this_turn = True
-                else:
-                    action_taken_successfully = False
-                    info['agent_action_details'] = "Agent tried Bonus Action but it was already used."
-                    info['agent_bonus_outcome'] = "Bonus action already used or not available."
-
-            elif decoded_action["type"] == "dash":
-                if not self.agent.used_action_this_turn:
-                    self.agent.took_dash_action_this_turn = True
-                    # Dash effectively increases available movement for the turn.
-                    # Speed_remaining is increased by speed_total.
-                    self.agent.speed_remaining += self.agent.speed_total
-                    self.agent.used_action_this_turn = True
-                    action_taken_successfully = True
-                    reward += 0.05
-                    info['agent_action_details'] = "Agent used Dash action."
-                else:
-                    action_taken_successfully = False
-                    info['agent_action_details'] = "Agent tried Dash but action already used."
-
-            elif decoded_action["type"] == "disengage":
-                if not self.agent.used_action_this_turn:
-                    self.agent.is_disengaging = True
-                    self.agent.used_action_this_turn = True
-                    action_taken_successfully = True
-                    reward += 0.05
-                    info['agent_action_details'] = "Agent used Disengage action."
-                else:
-                    action_taken_successfully = False
-                    info['agent_action_details'] = "Agent tried Disengage but action already used."
-
-            elif decoded_action["type"] == "dodge":
-                if not self.agent.used_action_this_turn:
-                    self.agent.is_dodging = True
-                    self.agent.used_action_this_turn = True
-                    action_taken_successfully = True
-                    reward += 0.05
-                    info['agent_action_details'] = "Agent used Dodge action."
-                else:
-                    action_taken_successfully = False
-                    info['agent_action_details'] = "Agent tried Dodge but action already used."
-
-            elif decoded_action["type"] == "end_turn":
-                action_taken_successfully = True # Signals agent is done
-                info['agent_action_details'] = "Agent chose to end turn."
-                # The turn will now proceed to the enemy. All agent's remaining actions are forfeited.
-                # To make this more explicit, we can set flags, though enemy turn follows regardless.
-                self.agent.used_action_this_turn = True
-                self.agent.used_bonus_action_this_turn = True
-                self.agent.speed_remaining = 0
-
-
-            elif decoded_action["type"] == "pass_turn":
-                action_taken_successfully = True # Passing is a valid choice
-                info['agent_action_details'] = "Agent passed turn (took no specific action)."
-                # This implies forfeiting action, bonus action, and movement for this step.
-                # If "pass_turn" means do absolutely nothing and end turn immediately:
-                self.agent.used_action_this_turn = True
-                self.agent.used_bonus_action_this_turn = True
-                self.agent.speed_remaining = 0
-
-
-            # If no action was successfully taken (e.g. tried to use an action already spent)
-            if not action_taken_successfully:
-                # Small penalty for trying an invalid sequence or running out of options.
-                reward -= 0.05
-                info['agent_action_outcome'] = info.get('agent_action_outcome', "Action failed or not allowed.")
-
-
-        # If agent's action caused termination (e.g. enemy defeated by agent's attack)
-        if terminated:
-            return self._get_obs(), reward, terminated, truncated, self._get_info()
-
-        # Enemy's Turn
-        if self.enemy.can_act(): # Check if enemy can act before its turn starts
-            # Call start_new_turn() for the enemy at the beginning of its turn.
-            self.enemy.start_new_turn()
-            dist_to_agent = self._calculate_manhattan_distance(self.enemy.position, self.agent.position)
-
-            if self.enemy_is_model_controlled and self.enemy_model and self.enemy_obs_flattener:
-                info['enemy_ai_type'] = 'model_controlled'
-                enemy_obs_dict = self._get_enemy_observation()
-                flat_enemy_obs = self.enemy_obs_flattener.observation(enemy_obs_dict)
-                enemy_action_id_array, _ = self.enemy_model.predict(flat_enemy_obs, deterministic=True)
-                enemy_action_id = int(enemy_action_id_array.item()) # Convert numpy array to int
-                
-                decoded_enemy_action = self._decode_action(enemy_action_id, is_enemy=True)
-                info['enemy_action_choice'] = f"Model chose: {decoded_enemy_action.get('type')} ({decoded_enemy_action.get('name', 'N/A')}; id {enemy_action_id})"
-                
-                enemy_action_type = decoded_enemy_action.get("type")
-                enemy_action_param_idx = decoded_enemy_action.get("index") 
-                enemy_action_delta = decoded_enemy_action.get("delta")
-
-                # enemy_action_taken_successfully = False # Not currently used for reward for enemy model
-                if enemy_action_type == "move":
-                    if enemy_action_delta:
-                        dx, dy = enemy_action_delta
-                        cost_for_this_move_action = abs(dx) + abs(dy)
-                        if self.enemy.speed_remaining >= cost_for_this_move_action:
-                            enemy_old_pos = list(self.enemy.position)
-                            enemy_target_x = self.enemy.position[0] + dx
-                            enemy_target_y = self.enemy.position[1] + dy
-
-                            # Opportunity Attack Check (Enemy Moving)
-                            if self.agent.can_act() and \
-                               self._calculate_manhattan_distance(enemy_old_pos, self.agent.position) == 1 and \
-                               self._calculate_manhattan_distance([enemy_target_x, enemy_target_y], self.agent.position) > 1 and \
-                               not self.enemy.is_disengaging and \
-                               not self.agent.used_reaction_this_round:
-
-                                agent_melee_attack_idx = -1
-                                for i, attack in enumerate(self.agent.attacks):
-                                    if attack.get("attack_type", "melee") == "melee":
-                                        agent_melee_attack_idx = i
-                                        break
-
-                                if agent_melee_attack_idx != -1:
-                                    info['opportunity_attack_by_agent'] = f"Agent Opportunity Attack on Enemy from {self.agent.position} to {enemy_old_pos} as enemy moves to {[enemy_target_x, enemy_target_y]}"
-                                    oa_adv_disadv_agent = None # No adv/disadv for standard OA by agent
-                                    hit, damage_dealt_to_enemy = self.agent.make_attack(self.enemy, agent_melee_attack_idx, self.dice_roller, advantage_disadvantage=oa_adv_disadv_agent)
-                                    if hit:
-                                        reward += damage_dealt_to_enemy # Positive reward for agent dealing damage
-                                        info['opportunity_attack_by_agent_outcome'] = f"Hit, dealt {damage_dealt_to_enemy} damage."
-                                    else:
-                                        info['opportunity_attack_by_agent_outcome'] = "Miss."
-                                    self.agent.used_reaction_this_round = True
-                                    if not self.enemy.is_alive:
-                                        terminated = True
-                                        reward += 100 # Bonus for agent winning via OA
-                                        info['combat_outcome'] = "Enemy died to Agent Opportunity Attack"
-                                        return self._get_obs(), reward, terminated, truncated, self._get_info()
-
-                            if not self.enemy.is_alive: # Check if OA killed enemy
-                                info['enemy_move_outcome'] = "Enemy died before completing move."
-                            elif [enemy_target_x, enemy_target_y] == self.agent.position and self.agent.is_alive:
-                                info['enemy_move_outcome'] = "Blocked by agent."
-                                # No speed deduction for bumping in 5e.
-                            elif self._is_valid_position(enemy_target_x, enemy_target_y):
-                                if self.enemy.move(dx, dy, self.map_width, self.map_height):
-                                    info['enemy_move_outcome'] = f"Moved ({dx},{dy})."
-                                else:
-                                    info['enemy_move_outcome'] = "Move failed (e.g. internal speed check)."
-                            else: # Hit wall
-                                info['enemy_move_outcome'] = "Hit wall."
-                                # No speed deduction for bumping wall in 5e.
-                        else:
-                             info['enemy_move_outcome'] = "Not enough speed for move action."
-                    else: 
-                        info['enemy_move_outcome'] = "Invalid move action from model (no delta)."
-
-                elif enemy_action_type == "attack":
-                    attack_idx = enemy_action_param_idx # This is from model's action choice
-                    if attack_idx is not None and 0 <= attack_idx < len(self.enemy.attacks):
-                        selected_attack_stats = self.enemy.attacks[attack_idx]
-                        attack_name = selected_attack_stats.get("name", f"Attack {attack_idx}")
-                        attack_range = selected_attack_stats.get("range", 1)
-                        enemy_attack_type = selected_attack_stats.get("attack_type", "melee")
-
-                        enemy_adv_disadv_status = None
-                        # Ranged attack disadvantage for enemy
-                        if enemy_attack_type == "ranged" and dist_to_agent <= 1:
-                            enemy_adv_disadv_status = 'disadvantage'
-                            info['enemy_attack_modifier'] = "Ranged attack at disadvantage (agent adjacent)."
-
-                        # Agent dodging effect
-                        if self.agent.is_dodging:
-                            if enemy_adv_disadv_status == 'advantage':
-                                enemy_adv_disadv_status = None
-                                info['enemy_attack_modifier'] = info.get('enemy_attack_modifier', "") + " Agent dodging cancels advantage."
-                            else:
-                                enemy_adv_disadv_status = 'disadvantage'
-                                info['enemy_attack_modifier'] = info.get('enemy_attack_modifier', "") + " Agent dodging, attack at disadvantage."
-
-                        info['enemy_action_details'] = f"Model Attack: {attack_name} (Range: {attack_range}, Type: {enemy_attack_type}, Adv/Disadv: {enemy_adv_disadv_status}), Target Dist: {dist_to_agent}"
-
-                        if dist_to_agent <= attack_range:
-                            old_agent_hp = self.agent.current_hp
-                            hit, _ = self.enemy.make_attack(self.agent, attack_idx, self.dice_roller, advantage_disadvantage=enemy_adv_disadv_status)
-                            actual_damage_taken = old_agent_hp - self.agent.current_hp
-                            if hit:
-                                reward -= actual_damage_taken
-                                info['enemy_attack_outcome'] = f"Hit, dealt {actual_damage_taken} damage."
-                            else:
-                                info['enemy_attack_outcome'] = "Miss."
-                            if not self.agent.is_alive:
-                                reward -= 100; terminated = True; info['combat_outcome'] = "Enemy won (model)"
-                        else:
-                            info['enemy_attack_outcome'] = "Out of range."
-                        self.enemy.used_action_this_turn = True # Mark action as used
-                    else: 
-                        info['enemy_attack_outcome'] = f"Invalid attack index {attack_idx} from model / Pass."
-                
-                elif enemy_action_type == "pass":
-                    info['enemy_action_details'] = "Model chose Pass."
-                
-                elif enemy_action_type == "bonus_action":
-                    ba_name_enemy = decoded_enemy_action.get("name") # Get name from decoded action
-                    is_valid_bonus = False
-                    if hasattr(self.enemy, 'bonus_actions'):
-                         # Check if the string ba_name_enemy is in the list self.enemy.bonus_actions
-                        if ba_name_enemy in self.enemy.bonus_actions:
-                             is_valid_bonus = True
-                    
-                    if is_valid_bonus and ba_name_enemy == "bonus_move_1_cell":
-                         self.enemy.speed_remaining +=1
-                         info['enemy_bonus_outcome'] = "Used bonus_move_1_cell."
-                    else:
-                         info['enemy_bonus_outcome'] = f"Bonus action '{ba_name_enemy}' not implemented or not available for enemy."
-                    info['enemy_action_details'] = f"Model chose Bonus Action: {ba_name_enemy}"
-
-
-                # Fallback for unhandled or invalid actions from model if no specific outcome was logged
-                if 'enemy_move_outcome' not in info and 'enemy_attack_outcome' not in info and \
-                   'enemy_bonus_outcome' not in info and enemy_action_type != "pass":
-                    info['enemy_action_details'] = info.get('enemy_action_details', "") + " Model chose unhandled or invalid action type, resulted in Pass."
-
-            else: # Rule-based AI for enemy (if not model-controlled)
-                info['enemy_ai_type'] = 'rule_based'
-                # Basic Rule-Based AI for Enemy (can be expanded for new actions)
-                # For now, it will try to attack if action available, then move.
-                # It doesn't yet use Dash, Dodge, Disengage intelligently.
-
-                if not self.enemy.used_action_this_turn and self.enemy.attacks:
-                    enemy_attack_stats = self.enemy.attacks[0]
-                    enemy_attack_range = enemy_attack_stats.get("range", 1)
-                    enemy_attack_type = enemy_attack_stats.get("attack_type", "melee") # Assume melee
-
-                    rb_adv_disadv_status = None
-                    if enemy_attack_type == "ranged" and dist_to_agent <= 1:
-                        rb_adv_disadv_status = 'disadvantage'
-                        info['enemy_attack_modifier'] = "Ranged attack at disadvantage (agent adjacent)."
-
-                    if self.agent.is_dodging:
-                        if rb_adv_disadv_status == 'advantage':
-                            rb_adv_disadv_status = None
-                            info['enemy_attack_modifier'] = info.get('enemy_attack_modifier', "") + " Agent dodging cancels advantage."
-                        else:
-                            rb_adv_disadv_status = 'disadvantage'
-                            info['enemy_attack_modifier'] = info.get('enemy_attack_modifier', "") + " Agent dodging, attack at disadvantage."
-
-                    if dist_to_agent <= enemy_attack_range:
-                        old_agent_hp = self.agent.current_hp
-                        hit, _ = self.enemy.make_attack(self.agent, 0, self.dice_roller, advantage_disadvantage=rb_adv_disadv_status)
-                        self.enemy.used_action_this_turn = True
-                        info['enemy_action_details'] = f"Rule-based Attack: {self.enemy.attacks[0].get('name')} (Adv/Disadv: {rb_adv_disadv_status})"
-                        if hit:
-                            actual_damage_taken = old_agent_hp - self.agent.current_hp
-                            reward -= actual_damage_taken
-                            info['enemy_attack_outcome'] = f"Hit, dealt {actual_damage_taken} damage."
-                        else:
-                            info['enemy_attack_outcome'] = "Miss."
-                        if not self.agent.is_alive:
-                            terminated = True
-                            reward -= 100
-                            info['combat_outcome'] = "Enemy won (rule-based)"
-                    else:
-                         info['enemy_attack_outcome'] = "Out of range for rule-based attack."
-                
-                # Rule-based Enemy Movement (with OA check)
-                if self.enemy.speed_remaining > 0 and (not self.enemy.used_action_this_turn or not self.enemy.attacks):
-                    enemy_old_pos_rb = list(self.enemy.position)
-                    # Simple move towards agent logic for rule-based enemy
-                    dx_rb, dy_rb = 0, 0
-                    if self.agent.position[0] > self.enemy.position[0]: dx_rb = 1
-                    elif self.agent.position[0] < self.enemy.position[0]: dx_rb = -1
-                    if self.agent.position[1] > self.enemy.position[1]: dy_rb = 1
-                    elif self.agent.position[1] < self.enemy.position[1]: dy_rb = -1
-
-                    # Try X movement first
-                    if dx_rb != 0 and self.enemy.speed_remaining > 0:
-                        enemy_target_x_rb, enemy_target_y_rb = self.enemy.position[0] + dx_rb, self.enemy.position[1]
-                        # OA Check for rule-based enemy movement (X-axis)
-                        if self.agent.can_act() and \
-                           self._calculate_manhattan_distance(enemy_old_pos_rb, self.agent.position) == 1 and \
-                           self._calculate_manhattan_distance([enemy_target_x_rb, enemy_target_y_rb], self.agent.position) > 1 and \
-                           not self.enemy.is_disengaging and not self.agent.used_reaction_this_round:
-                            agent_melee_idx_rb_x = -1
-                            for i, att in enumerate(self.agent.attacks):
-                                if att.get("attack_type", "melee") == "melee": agent_melee_idx_rb_x = i; break
-                            if agent_melee_idx_rb_x != -1:
-                                info['opportunity_attack_by_agent_rb_x'] = f"Agent OA on Enemy (X-move) from {self.agent.position} to {enemy_old_pos_rb}"
-                                hit_oa_rb_x, dmg_oa_rb_x = self.agent.make_attack(self.enemy, agent_melee_idx_rb_x, self.dice_roller, advantage_disadvantage=None)
-                                if hit_oa_rb_x: reward += dmg_oa_rb_x; info['opportunity_attack_by_agent_rb_x_outcome'] = f"Hit, {dmg_oa_rb_x} dmg."
-                                else: info['opportunity_attack_by_agent_rb_x_outcome'] = "Miss."
-                                self.agent.used_reaction_this_round = True
-                                if not self.enemy.is_alive: terminated = True; reward += 100; info['combat_outcome'] = "Enemy died to Agent OA (RB X-move)"; return self._get_obs(), reward, terminated, truncated, self._get_info()
-                        
-                        if self.enemy.is_alive and not ([enemy_target_x_rb, enemy_target_y_rb] == self.agent.position and self.agent.is_alive) and self._is_valid_position(enemy_target_x_rb, enemy_target_y_rb):
-                            if self.enemy.move(dx_rb, 0, self.map_width, self.map_height):
-                                info["enemy_move_outcome"] = f"Moved ({dx_rb},0) (rule-based)."
-                                enemy_old_pos_rb = list(self.enemy.position) # Update old_pos for Y move check
-                            else: info["enemy_move_outcome"] = "X-Move failed (rule-based)."
-                        elif ([enemy_target_x_rb, enemy_target_y_rb] == self.agent.position and self.agent.is_alive) : info["enemy_move_outcome"] = "Blocked by agent (X-move)."
-                        else: info["enemy_move_outcome"] = "Invalid X-move or hit wall."
-
-
-                    # Try Y movement if still has speed
-                    if dy_rb != 0 and self.enemy.speed_remaining > 0 and self.enemy.is_alive:
-                        enemy_target_x_rb, enemy_target_y_rb = self.enemy.position[0], self.enemy.position[1] + dy_rb
-                        # OA Check for rule-based enemy movement (Y-axis)
-                        if self.agent.can_act() and \
-                           self._calculate_manhattan_distance(enemy_old_pos_rb, self.agent.position) == 1 and \
-                           self._calculate_manhattan_distance([enemy_target_x_rb, enemy_target_y_rb], self.agent.position) > 1 and \
-                           not self.enemy.is_disengaging and not self.agent.used_reaction_this_round:
-                            agent_melee_idx_rb_y = -1
-                            for i, att in enumerate(self.agent.attacks):
-                                if att.get("attack_type", "melee") == "melee": agent_melee_idx_rb_y = i; break
-                            if agent_melee_idx_rb_y != -1:
-                                info['opportunity_attack_by_agent_rb_y'] = f"Agent OA on Enemy (Y-move) from {self.agent.position} to {enemy_old_pos_rb}"
-                                hit_oa_rb_y, dmg_oa_rb_y = self.agent.make_attack(self.enemy, agent_melee_idx_rb_y, self.dice_roller, advantage_disadvantage=None)
-                                if hit_oa_rb_y: reward += dmg_oa_rb_y; info['opportunity_attack_by_agent_rb_y_outcome'] = f"Hit, {dmg_oa_rb_y} dmg."
-                                else: info['opportunity_attack_by_agent_rb_y_outcome'] = "Miss."
-                                self.agent.used_reaction_this_round = True
-                                if not self.enemy.is_alive: terminated = True; reward += 100; info['combat_outcome'] = "Enemy died to Agent OA (RB Y-move)"; return self._get_obs(), reward, terminated, truncated, self._get_info()
-
-                        if self.enemy.is_alive and not ([enemy_target_x_rb, enemy_target_y_rb] == self.agent.position and self.agent.is_alive) and self._is_valid_position(enemy_target_x_rb, enemy_target_y_rb):
-                            current_move_outcome = info.get("enemy_move_outcome", "")
-                            if self.enemy.move(0, dy_rb, self.map_width, self.map_height):
-                                info["enemy_move_outcome"] = current_move_outcome + f" Moved (0,{dy_rb}) (rule-based)."
-                            else: info["enemy_move_outcome"] = current_move_outcome + " Y-Move failed (rule-based)."
-                        elif ([enemy_target_x_rb, enemy_target_y_rb] == self.agent.position and self.agent.is_alive) : info["enemy_move_outcome"] = info.get("enemy_move_outcome","") + " Blocked by agent (Y-move)."
-                        else: info["enemy_move_outcome"] = info.get("enemy_move_outcome","") + " Invalid Y-move or hit wall."
-
-                    if not info.get("enemy_move_outcome"): # If no move outcome was logged
-                         info["enemy_move_outcome"] = "No valid moves or decided not to move (rule-based)."
-                    else:
-                        info["enemy_move_outcome"] = "No speed remaining (rule-based)."
-
-                # Enemy ends its turn by default after these checks
-                self.enemy.used_action_this_turn = True
-                self.enemy.used_bonus_action_this_turn = True # Assuming no bonus actions for rule-based for now
-
-
-        # Check for truncation due to max steps
         if not terminated and self.current_episode_steps >= self.max_episode_steps:
             truncated = True
-            # Reward for truncation is neutral; step penalty and survival (if applicable) already applied.
 
-        return self._get_obs(), reward, terminated, truncated, self._get_info()
+        return self._get_obs(), reward, terminated, truncated, {**self._get_info(), **info}
 
     def _render_pygame_frame(self, surface: pygame.Surface):
         if surface is None: return

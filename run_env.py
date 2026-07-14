@@ -9,6 +9,7 @@ from gymnasium.utils.env_checker import check_env
 from dnd_gym_env import DnDCombatEnv 
 from bestiary.commoner import get_commoner_stats
 from bestiary.wolf import get_wolf_stats
+from bestiary.bandit import get_bandit_stats
 
 MODEL_PATH = "dnd_dqn_agent.zip" # Default path for the agent's model
 
@@ -33,7 +34,7 @@ def main(agent_control_arg: str,
     print(f"Frame export path: {export_frames_path_arg if export_frames_path_arg else 'Disabled'}")
     print("------------------------------------")
 
-    agent_stats = get_commoner_stats()
+    agent_stats = get_bandit_stats()
     enemy_stats = get_wolf_stats()
 
     # Create the raw environment - this instance will be used throughout.

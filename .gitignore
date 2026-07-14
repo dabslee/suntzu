@@ -24,6 +24,7 @@ Thumbs.db
 *.zip
 *tensorboard*/
 *.pt
+run_env_output/
 
 # Environment variables
 .env

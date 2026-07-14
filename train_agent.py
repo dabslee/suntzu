@@ -10,11 +10,13 @@ from gymnasium.wrappers import FlattenObservation
 
 # Assuming dnd_gym_env.py and bestiary are in the same directory or accessible in PYTHONPATH
 from dnd_gym_env import DnDCombatEnv
-from bestiary.commoner import get_commoner_stats
+from bestiary.guard import get_guard_stats
 from bestiary.wolf import get_wolf_stats
 
 # --- Configuration ---
-AGENT_STATS = get_commoner_stats()
+# Guard vs. wolf is a winnable matchup, so the reward signal contains wins.
+# (A commoner's 4 HP vs. a wolf is near-unwinnable and trains poorly.)
+AGENT_STATS = get_guard_stats()
 ENEMY_STATS = get_wolf_stats()
 MAP_WIDTH = 10
 MAP_HEIGHT = 10

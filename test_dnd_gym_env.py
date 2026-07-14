@@ -200,8 +200,8 @@ def test_env_initialization(dnd_env, agent_stats_env, enemy_stats_env):
     assert dnd_env.enemy.name == "enemy"
     assert dnd_env.map_width == 10 and dnd_env.map_height == 10
 
-    # Action space: 4 moves + num_agent_attacks + num_agent_bonus_actions + 1 pass
-    expected_num_actions = 4 + len(agent_stats_env["attacks"]) + len(agent_stats_env["bonus_actions"]) + 1
+    # Action space: 4 moves + attacks + bonus actions + dash/disengage/dodge + end_turn
+    expected_num_actions = 4 + len(agent_stats_env["attacks"]) + len(agent_stats_env["bonus_actions"]) + 3 + 1
     assert isinstance(dnd_env.action_space, spaces.Discrete)
     assert dnd_env.action_space.n == expected_num_actions
 
@@ -292,14 +292,14 @@ def test_step_enemy_attack_agent_ko(dnd_env, enemy_stats_env): # agent_stats_env
     # No need to change enemy_stats_env['attacks'][0]['damage_dice'] if it's already strong enough.
     # damage_taken_to_ko_agent = dnd_env.agent.current_hp # which is 1
 
-    # Agent passes turn, allowing enemy to act
+    # Agent ends its turn, allowing enemy to act
     pass_action_idx = -1
     for i, action_def in enumerate(dnd_env.action_map):
-        if action_def["type"] == "pass":
+        if action_def["type"] == "end_turn":
             pass_action_idx = i
             break
     assert pass_action_idx != -1
-    
+
     obs, reward, terminated, truncated, info = dnd_env.step(pass_action_idx)
 
     # If agent is still alive, it means the enemy's attack missed.
@@ -308,16 +308,14 @@ def test_step_enemy_attack_agent_ko(dnd_env, enemy_stats_env): # agent_stats_env
 
     assert terminated is True, "Episode should be terminated after agent KO"
     assert dnd_env.agent.is_alive is False, "Agent should be KO'd"
-    
+
     # Expected reward components:
-    # -0.1 (step penalty for agent's pass action)
-    # +0.5 (agent survival after its pass action)
+    # -0.1 (step penalty for agent's end_turn action)
     # -1 (damage taken by agent, since agent_hp was 1)
     # -100 (loss penalty)
-    # Total = -0.1 + 0.5 - 1 - 100 = -100.6
-    # The damage_taken_by_agent is implicitly 1 because current_hp was 1.
+    # Total = -0.1 - 1 - 100 = -101.1
     damage_taken_to_ko_agent = 1 # Based on setup current_hp=1
-    expected_reward = -0.1 + 0.5 - damage_taken_to_ko_agent - 100
+    expected_reward = -0.1 - damage_taken_to_ko_agent - 100
     
     assert reward == pytest.approx(expected_reward), f"Reward for agent KO is incorrect. Got {reward}, expected {expected_reward}"
     assert obs["agent_hp_norm"][0] == 0.0
@@ -354,8 +352,8 @@ def test_step_movement(dnd_env):
     expected_new_pos = [initial_pos[0] + expected_delta[0], initial_pos[1] + expected_delta[1]]
     
     assert np.array_equal(obs["agent_pos"], expected_new_pos)
-    # Expected reward: -0.1 (step penalty) + 0.5 (survival reward) = 0.4
-    assert reward == pytest.approx(0.4), "Reward for simple move action is incorrect"
+    # A move mid-turn: only the -0.1 step penalty applies (enemy does not act yet).
+    assert reward == pytest.approx(-0.1), "Reward for simple move action is incorrect"
     assert terminated is False
 
 def test_agent_move_into_occupied_cell(dnd_env):
@@ -377,8 +375,8 @@ def test_agent_move_into_occupied_cell(dnd_env):
     obs, reward, terminated, truncated, info = dnd_env.step(move_south_action_idx)
 
     assert np.array_equal(obs["agent_pos"], [0, 0]), "Agent should not have moved"
-    # Agent attempted to move 1 cell, so 1 speed point should be consumed.
-    assert dnd_env.agent.speed_remaining == initial_agent_speed - 1, "Agent speed not deducted correctly for failed move"
+    # A blocked move costs no movement (5e rules); it is just an invalid action.
+    assert dnd_env.agent.speed_remaining == initial_agent_speed, "Blocked move should not consume speed"
     assert terminated is False
 
 def test_enemy_move_into_occupied_cell(dnd_env, enemy_stats_env): # Add enemy_stats_env fixture
@@ -395,10 +393,10 @@ def test_enemy_move_into_occupied_cell(dnd_env, enemy_stats_env): # Add enemy_st
     dnd_env.enemy.speed_remaining = initial_enemy_speed # Ensure enemy has speed
 
 
-    # Agent passes, so enemy gets to move
+    # Agent ends its turn, so enemy gets to move
     pass_action_idx = -1
     for i, action_def in enumerate(dnd_env.action_map):
-        if action_def["type"] == "pass":
+        if action_def["type"] == "end_turn":
             pass_action_idx = i
             break
     assert pass_action_idx != -1
@@ -534,12 +532,11 @@ def test_enemy_move_into_occupied_cell(dnd_env, enemy_stats_env): # Add enemy_st
     # Agent passes again
     obs, reward, terminated, truncated, info = dnd_env.step(pass_action_idx)
 
-    # Enemy's second move: dx=1, dy=0. Target is [1,0] (agent's position).
-    # This move should be blocked by the agent. Enemy position remains [0,0]. 
-    # Speed was reset to initial_enemy_speed at the start of this (enemy's second) turn, then 1 is deducted for collision.
+    # Enemy's second turn: it is now adjacent to the agent (within "reach"),
+    # so the rule-based AI stops moving. Speed was reset at the start of its
+    # turn and a blocked/unattempted move costs nothing.
     assert np.array_equal(dnd_env.enemy.position, [0,0]), "Enemy should not have moved (blocked by agent)"
-    print(f"DEBUG_TEST: Enemy speed before final assertion: {dnd_env.enemy.speed_remaining}, expected: {initial_enemy_speed - 1}")
-    assert dnd_env.enemy.speed_remaining == initial_enemy_speed - 1, "Enemy speed not deducted correctly for collision in the second turn"
+    assert dnd_env.enemy.speed_remaining == initial_enemy_speed, "Enemy speed should be untouched when it cannot move"
     assert terminated is False
     
     dnd_env.enemy.attacks = original_enemy_attacks # Restore attacks
@@ -563,7 +560,8 @@ def test_agent_move_into_wall_consumes_speed(dnd_env):
     obs, reward, terminated, truncated, info = dnd_env.step(move_north_action_idx)
 
     assert np.array_equal(obs["agent_pos"], [0, 0]), "Agent should not have moved"
-    assert dnd_env.agent.speed_remaining == initial_agent_speed - 1, "Agent speed not deducted for bumping wall"
+    # Bumping a wall costs no movement (5e rules); it is just an invalid action.
+    assert dnd_env.agent.speed_remaining == initial_agent_speed, "Blocked move should not consume speed"
     assert terminated is False
 
 
@@ -600,7 +598,10 @@ def test_action_decoding_and_mapping(dnd_env):
 
     for i in range(num_actions):
         decoded_action = dnd_env._decode_action(i) # Test the internal helper
-        assert decoded_action == action_map[i]
+        # _decode_action may rewrite 'name' for logging (e.g. "bonus_<name>");
+        # everything else must match the action map entry.
+        assert {k: v for k, v in decoded_action.items() if k != "name"} == \
+               {k: v for k, v in action_map[i].items() if k != "name"}
         assert "type" in decoded_action
         assert "name" in decoded_action
 
@@ -610,7 +611,7 @@ def test_action_decoding_and_mapping(dnd_env):
             assert "index" in decoded_action
         elif decoded_action["type"] == "bonus_action":
             assert "index" in decoded_action # or "name" is enough
-        elif decoded_action["type"] == "pass":
+        elif decoded_action["type"] in ("dash", "disengage", "dodge", "end_turn"):
             pass # No other keys needed
         else:
             pytest.fail(f"Unknown decoded action type: {decoded_action['type']}")
@@ -639,14 +640,18 @@ def test_episode_truncation(dnd_env): # Uses the dnd_env fixture
     obs, info = env.reset(seed=12) # Use a seed for reproducibility
     assert env.current_episode_steps == 0, "current_episode_steps should be 0 after reset"
 
-    # Determine a pass action.
+    # Disarm the enemy so repeated end_turn actions cannot lead to the agent
+    # being killed (which would terminate rather than truncate the episode).
+    env.enemy.attacks = []
+
+    # Determine the end_turn action.
     pass_action_idx = -1
     for i, action_def in enumerate(env.action_map):
-        if action_def.get("name") == "pass_turn": # Assuming name is "pass_turn"
+        if action_def.get("name") == "end_turn":
             pass_action_idx = i
             break
     if pass_action_idx == -1:
-        pytest.fail("Could not determine 'pass_turn' action from env.action_map.")
+        pytest.fail("Could not determine 'end_turn' action from env.action_map.")
 
     terminated = False
     truncated = False # Variable to store truncated from last step
@@ -711,7 +716,7 @@ def get_action_idx(env_instance, action_type_or_name: str, attack_name: Optional
 
     # Fallback for simple types if name wasn't specific enough initially
     # and no specific sub_name (like attack_name) was provided.
-    if action_type_or_name in ["attack", "move", "bonus_action", "pass_turn", "end_turn", "dash", "disengage", "dodge"] and not attack_name:
+    if action_type_or_name in ["attack", "move", "bonus_action", "end_turn", "dash", "disengage", "dodge"] and not attack_name:
         for i, action_def in enumerate(env_instance.action_map):
              if action_def["type"] == action_type_or_name:
                   return i # Return first match for generic types if no sub-name given
@@ -841,7 +846,7 @@ def test_disengage_and_opportunity_attack(dnd_env):
 
     disengage_idx = get_action_idx(dnd_env, "disengage")
     move_e_idx = get_action_idx(dnd_env, "move_E") # Action to move away
-    pass_idx = get_action_idx(dnd_env, "pass_turn")
+    pass_idx = get_action_idx(dnd_env, "end_turn")
 
     # Scenario 1: OA Triggered
     agent.start_new_turn()
@@ -902,7 +907,7 @@ def test_dodge_action(dnd_env):
     enemy = dnd_env.enemy
 
     dodge_idx = get_action_idx(dnd_env, "dodge")
-    pass_idx = get_action_idx(dnd_env, "pass_turn") # Agent passes so enemy can attack
+    pass_idx = get_action_idx(dnd_env, "end_turn") # Agent passes so enemy can attack
 
     # Agent takes Dodge action
     agent.start_new_turn()
@@ -1032,7 +1037,7 @@ def test_new_observation_fields(dnd_env):
     # Give enemy no attacks so it's forced to consider moving.
     original_enemy_attacks = enemy.attacks
     enemy.attacks = []
-    pass_idx = get_action_idx(dnd_env, "pass_turn")
+    pass_idx = get_action_idx(dnd_env, "end_turn")
     obs, _, _, _, info = dnd_env.step(pass_idx) # Agent passes, enemy turn happens.
 
     # Now check agent's observation from THIS step (which includes enemy turn)
