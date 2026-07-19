@@ -17,10 +17,10 @@ alternating self-play.
 | [dnd_gym_env.py](dnd_gym_env.py) | The core module: `Creature` (stats + combat state) and `DnDCombatEnv` (the Gymnasium environment, including pygame rendering and optional model-controlled enemy). |
 | [dice.py](dice.py) | Dice-string roller, e.g. `1d8+3`, `2d20kh1` (advantage), `2d20kl1` (disadvantage). |
 | [bestiary/](bestiary/) | Creature stat blocks (`commoner`, `wolf`, `cat`, `bandit`, `guard`, `goblin`, `scout`). Each module exposes `get_<name>_stats()` returning a dict of AC, HP, speed, attacks, and bonus actions. |
-| [train_agent.py](train_agent.py) | Trains a single DQN agent (guard vs. wolf by default) against the rule-based enemy or a saved enemy model, then runs a 20-episode evaluation. |
-| [train_alternating.py](train_alternating.py) | Alternating self-play: trains model A against the latest model B, then B against the updated A, for N iterations. |
+| [train_agent.py](train_agent.py) | Trains a single MaskablePPO agent (guard vs. wolf by default) against the rule-based enemy or a saved enemy model, then runs a 20-episode evaluation. |
+| [train_alternating.py](train_alternating.py) | Alternating self-play with MaskablePPO: trains model A against the latest model B, then B against the updated A, for N iterations. |
 | [evaluate_models.py](evaluate_models.py) | Pits two saved models against each other for many episodes and reports win/loss/draw rates. |
-| [run_env.py](run_env.py) | Interactive/visual runner with pygame rendering; agent can be random or model-controlled; can export PNG frames per step. |
+| [run_env.py](run_env.py) | Symmetric spectator: drives **both** combatants itself one micro-action at a time (via the env's spectator API), so every micro-action — including each of the opponent's moves — gets its own frame and log line. Creature-art tokens with name labels and condition badges, framed as **Agent 1** and **Agent 2**. Each side is model-controlled if given a model (`--agent1_model`/`--agent2_model`), else random. Selectable matchup (`--agent1_creature`/`--agent2_creature`), optional per-micro-action PNG export. |
 | [test_dice.py](test_dice.py), [test_dnd_gym_env.py](test_dnd_gym_env.py) | Pytest suites for the dice roller and the environment. |
 | `models/` | Saved `.zip` DQN checkpoints from past runs. **Note:** checkpoints predating the turn-structure fix (see below) were trained on broken dynamics and a different action-space size; they should be retrained. |
 | `dnd_dqn_tensorboard/`, `dnd_selfplay_tensorboard/` | TensorBoard logs from past runs. |
@@ -31,7 +31,9 @@ alternating self-play.
 `DnDCombatEnv` is a standard `gym.Env` with a `Dict` observation space and a
 `Discrete` action space. Training scripts wrap it in
 `gymnasium.wrappers.FlattenObservation` (SB3's `MlpPolicy` needs a flat vector)
-and then `DummyVecEnv`.
+and then `DummyVecEnv`. The env also exposes `action_masks()` (the sb3-contrib
+MaskablePPO hook): a boolean validity mask mirroring the executor's rules, so
+a masked policy never samples currently-illegal actions.
 
 ### Observation space
 
@@ -43,16 +45,31 @@ All values are from the agent's perspective:
 - `agent_speed_remaining_norm` — remaining movement this turn (clamped to 1.0)
 - `agent_used_action`, `agent_used_bonus_action`, `agent_used_reaction`,
   `agent_is_dodging` — action-economy flags (0/1)
+- `agent_attacks_remaining_norm` — unspent Multiattack rolls this turn
+- `agent_is_prone` / `agent_is_hidden` / `agent_is_grappled` and
+  `enemy_is_prone` / `enemy_is_hidden` / `enemy_is_grappled` /
+  `enemy_is_dodging` — condition flags (hidden/grappled are wired but always 0
+  until the stealth and contests phases land)
+
+The same builder produces the model-controlled enemy's observation with roles
+swapped, so both seats always see symmetric features.
 
 ### Action space
 
 Built per-creature by `_build_action_map_for_creature`:
 
 1. Four single-cell moves (N/S/E/W)
-2. One action per attack in the creature's stat block
+2. One action per attack in the creature's stat block (taking the first attack
+   of a turn grants `num_attacks` Multiattack rolls, spent one per step; the
+   first attack's melee/ranged type locks the rest, per the scout's "two melee
+   attacks or two ranged attacks")
 3. One action per bonus action in the stat block
-4. Dash, Disengage, Dodge
-5. `end_turn` (hand the round over to the opponent)
+4. Dash, Disengage, Dodge, `stand_up` (from prone; costs half speed), Hide,
+   Search, and the special melee attacks `shove_prone`, `shove_push`,
+   `grapple`, plus `escape_grapple`
+5. Trait-driven bonus actions: creatures with Nimble Escape (goblin) get
+   `bonus_disengage` and `bonus_hide`
+6. `end_turn` (hand the round over to the opponent)
 
 Because the action space size depends on the creature's attack/bonus-action
 count, models trained for one creature are not interchangeable with another
@@ -78,10 +95,36 @@ through the same shared action executor, so agent and enemy play by identical
 rules — important for self-play, where a model trained in the agent seat is
 later deployed in the enemy seat.
 
-Implemented 5e mechanics: attack rolls vs. AC with advantage/disadvantage,
-ranged attacks at disadvantage when adjacent, the Dodge action imposing
-disadvantage, Dash adding speed, Disengage suppressing opportunity attacks, and
-opportunity attacks when a creature leaves melee reach.
+Implemented 5e mechanics: attack rolls vs. AC with advantage/disadvantage
+(all sources are collected and stacked with the real 5e rule — any advantage
+plus any disadvantage yields a straight roll), Multiattack, ranged attacks at
+disadvantage when adjacent, normal/long weapon ranges (disadvantage past
+normal range, invalid past long range), on-hit saving-throw riders (the wolf's
+bite knocks its target prone on a failed DC 11 STR save), the prone condition
+(advantage for adjacent attackers, disadvantage at range and on the prone
+creature's own attacks, crawling at double cost, standing for half speed),
+the Dodge action, Dash, Disengage, opportunity attacks when a creature leaves
+melee reach, ability scores/saving throws, and per-creature skills and passive
+Perception.
+
+**Stealth** (abstracted — there is no terrain, so hiding shifts dice odds
+rather than concealing position, and positions stay fully observable): Hide is
+allowed only while not adjacent, rolling Stealth vs. the enemy's passive
+Perception. While hidden your attacks have advantage and attacks against you
+have disadvantage; attacking or becoming adjacent reveals you. Search spends
+the Action on an active Perception check vs. `10 + Stealth` (keen-sense traits
+grant advantage). The rule-based AI searches when its target is hidden.
+
+**Contests**: Shove (knock prone or push one cell) and Grapple replace one
+attack of the Attack action and are resolved as contested checks — Athletics
+vs. the defender's best of Athletics/Acrobatics, ties to the defender. A
+grappled creature cannot move until it spends its Action to escape (contested
+again) or the grappler moves out of reach, which releases the grapple
+(dragging is not modeled).
+
+Creature traits are declarative: `nimble_escape` adds the goblin's bonus
+actions, `keen_*` grants Search advantage, and `pack_tactics` is wired into
+the advantage logic but inert until multi-creature combat exists.
 
 ### Rewards (per step, from the agent's perspective)
 
@@ -89,9 +132,12 @@ opportunity attacks when a creature leaves melee reach.
 - `+damage` dealt to the enemy / `-damage` taken from the enemy (actual HP
   lost, including damage dealt or taken via opportunity attacks)
 - `+100` for killing the enemy, `-100` for dying
-- `+0.05` for Dash/Disengage/Dodge, `+0.02` for the example bonus action
 - `-0.05` for choosing an unavailable action (e.g. attacking when the action
   was already used, or moving into a wall)
+
+There is deliberately no shaping bonus for utility actions (the old +0.05 for
+Dash/Dodge/Disengage was removed when the action space grew) — their value has
+to flow through damage avoided and fights won.
 
 A step that ends the agent's turn also includes the reward consequences of the
 enemy's entire turn. Episodes truncate at `max_episode_steps` (default 100
@@ -125,8 +171,11 @@ python train_alternating.py --agent1_stats_module bestiary.wolf --agent2_stats_m
 python evaluate_models.py --model1_path models/commoner_v_wolf_3.zip --model2_path models/wolf_v_commoner_3.zip \
     --agent_stats_module bestiary.commoner --enemy_stats_module bestiary.wolf --num_episodes 1000
 
-# Watch an episode with pygame rendering (random or model-controlled agent)
-python run_env.py --agent_control model --agent_model_path dnd_dqn_agent.zip
+# Watch an episode with pygame rendering (both sides driven one action per frame)
+python run_env.py --agent1_creature goblin --agent2_creature wolf          # both random
+python run_env.py --agent1_creature wolf --agent2_creature goblin \
+    --agent1_model models/dnd_agent1_selfplay.zip \
+    --agent2_model models/dnd_agent2_selfplay.zip   # trained self-play models fight
 
 # Run tests
 pytest test_dice.py test_dnd_gym_env.py
@@ -172,11 +221,41 @@ verification found the causes, all fixed in the current revision:
 
 ## Remaining limitations
 
-- `num_attacks` (Multiattack) is parsed but not used — every attack action is
-  a single attack roll.
-- Special monster traits (Pack Tactics, Nimble Escape, Hide) are not
-  implemented; goblin bonus actions are placeholders with no effect.
+See [ACTION_SPACE_PLAN.md](ACTION_SPACE_PLAN.md) for the full roadmap.
+Phases 0–3 are done: abilities/saves/conditions, Multiattack, weapon ranges,
+prone, Hide/Search, Nimble Escape, and Shove/Grapple — the complete
+no-ally, no-object subset of SRD standard actions for the seven bestiary
+creatures. Still missing:
+
+- Pack Tactics and Help need multi-creature combat; declared but inert.
 - No critical hits/misses (a natural 20/1 is just a high/low roll), no
-  diagonal movement, no terrain or obstacles.
-- The rule-based enemy AI is simple: close to range of its first attack, then
-  attack. It never uses Dash, Dodge, Disengage, or ranged/melee switching.
+  diagonal movement, no terrain or obstacles (so the cat's climb speed is
+  meaningless and stealth is abstracted), no Ready action, no spells.
+- The rule-based enemy AI is simple: stand up if prone, search if its target
+  is hidden, close to range of its first attack, then attack with its full
+  Multiattack. It never uses Dash, Dodge, Disengage, shoves, or grapples.
+
+## Training performance
+
+Training uses **MaskablePPO** (sb3-contrib) with three measured ingredients —
+switched from single-env DQN after profiling showed >95% of wall time was
+per-step PyTorch overhead, not the environment:
+
+1. **8 vectorized envs in one `DummyVecEnv`** — batches the policy forward
+   pass (the win is batching, not parallelism; threads/subprocesses don't
+   help because the env itself steps at ~18k steps/s while learning ran at
+   ~870).
+2. **Action masking** via the env's `action_masks()` — with 15–19 actions per
+   creature and most invalid at any moment, unmasked exploration wastes most
+   of its samples on no-ops.
+3. **`VecNormalize(norm_reward=True)`** — PPO's value function chokes on the
+   ±100 terminal rewards without it (0% wins even at 150k steps); with it,
+   learning takes off. Observations are *not* normalized, so saved policies
+   run standalone (as evaluation agents or `enemy_model_path` opponents)
+   without needing the normalizer's statistics.
+
+Measured on guard vs. rule-based wolf: DQN managed ~870 steps/s and a 19%
+win rate at 30k steps (~35 s); MaskablePPO runs ~3,400 steps/s and reaches
+**32% wins in 13 s / 47% wins in 40 s**. Old DQN checkpoints cannot be
+*resumed* by the PPO scripts, but they still load fine as opponents and in
+`run_env.py`/`evaluate_models.py` (`load_model_any` handles both formats).

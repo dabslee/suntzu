@@ -2,4 +2,5 @@ gymnasium
 numpy
 pygame
 stable-baselines3
+sb3-contrib
 tensorboard

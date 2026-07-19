@@ -200,8 +200,11 @@ def test_env_initialization(dnd_env, agent_stats_env, enemy_stats_env):
     assert dnd_env.enemy.name == "enemy"
     assert dnd_env.map_width == 10 and dnd_env.map_height == 10
 
-    # Action space: 4 moves + attacks + bonus actions + dash/disengage/dodge + end_turn
-    expected_num_actions = 4 + len(agent_stats_env["attacks"]) + len(agent_stats_env["bonus_actions"]) + 3 + 1
+    # Action space: 4 moves + attacks + bonus actions
+    #             + dash/disengage/dodge/stand_up/hide/search
+    #             + shove_prone/shove_push/grapple/escape_grapple + end_turn
+    # (creatures with nimble_escape also get bonus_disengage/bonus_hide)
+    expected_num_actions = 4 + len(agent_stats_env["attacks"]) + len(agent_stats_env["bonus_actions"]) + 10 + 1
     assert isinstance(dnd_env.action_space, spaces.Discrete)
     assert dnd_env.action_space.n == expected_num_actions
 
@@ -611,7 +614,9 @@ def test_action_decoding_and_mapping(dnd_env):
             assert "index" in decoded_action
         elif decoded_action["type"] == "bonus_action":
             assert "index" in decoded_action # or "name" is enough
-        elif decoded_action["type"] in ("dash", "disengage", "dodge", "end_turn"):
+        elif decoded_action["type"] in ("dash", "disengage", "dodge", "stand_up", "hide", "search",
+                                        "shove_prone", "shove_push", "grapple", "escape_grapple",
+                                        "bonus_disengage", "bonus_hide", "end_turn"):
             pass # No other keys needed
         else:
             pytest.fail(f"Unknown decoded action type: {decoded_action['type']}")
@@ -727,7 +732,8 @@ def get_action_idx(env_instance, action_type_or_name: str, attack_name: Optional
 # --- Tests for New Mechanics ---
 
 # Expected keys for any creature stat block
-EXPECTED_STAT_KEYS = ["ac", "max_hp", "speed_total", "attacks", "bonus_actions"]
+EXPECTED_STAT_KEYS = ["ac", "max_hp", "speed_total", "attacks", "bonus_actions",
+                      "abilities", "skills", "passive_perception", "traits"]
 
 @pytest.mark.parametrize("stat_func, creature_name", [
     (get_cat_stats, "Cat"),
@@ -1064,3 +1070,565 @@ def test_new_observation_fields(dnd_env):
         # for the *enemy* if it's model-based, as that would be generated mid-step.
 
     enemy.attacks = original_enemy_attacks # Restore
+
+
+# --- Tests for Phase 0/1 mechanics: abilities, saves, multiattack, range, prone ---
+
+from bestiary.wolf import get_wolf_stats as _wolf_stats
+from bestiary.scout import get_scout_stats as _scout_stats
+
+
+def make_roller(values):
+    """Deterministic dice roller that returns the given values in order."""
+    seq = list(values)
+    def roller(dice_string):
+        return seq.pop(0)
+    return roller
+
+
+def find_action(env, name):
+    for i, a in enumerate(env.action_map):
+        if a["name"] == name:
+            return i
+    raise ValueError(f"action {name} not in map")
+
+
+def test_ability_modifiers_and_saving_throws():
+    wolf = Creature(name="wolf", initial_position=[0, 0], **_wolf_stats())
+    assert wolf.ability_modifier("str") == 1   # STR 12
+    assert wolf.ability_modifier("dex") == 2   # DEX 15
+    assert wolf.ability_modifier("int") == -4  # INT 3
+    # d20 roll of 10 + STR mod 1 = 11 vs DC 11 -> success
+    assert wolf.saving_throw("str", 11, make_roller([10])) is True
+    # d20 roll of 9 + 1 = 10 vs DC 11 -> failure
+    assert wolf.saving_throw("str", 11, make_roller([9])) is False
+
+
+def test_advantage_disadvantage_stacking(dnd_env):
+    dnd_env.reset(seed=200)
+    agent, enemy = dnd_env.agent, dnd_env.enemy
+    attack = agent.attacks[0]  # melee longsword
+
+    # No modifiers -> straight roll
+    status, msgs = dnd_env._resolve_attack_modifiers(agent, enemy, attack, 1, "agent", "enemy")
+    assert status is None and msgs == []
+
+    # Target prone and adjacent -> advantage
+    enemy.conditions.add("prone")
+    status, _ = dnd_env._resolve_attack_modifiers(agent, enemy, attack, 1, "agent", "enemy")
+    assert status == 'advantage'
+
+    # Add a disadvantage source (attacker also prone): adv + dis -> straight roll
+    agent.conditions.add("prone")
+    status, msgs = dnd_env._resolve_attack_modifiers(agent, enemy, attack, 1, "agent", "enemy")
+    assert status is None
+    assert any("cancel" in m for m in msgs)
+
+    # Two disadvantage sources and one advantage source still cancel to straight
+    enemy.is_dodging = True
+    status, _ = dnd_env._resolve_attack_modifiers(agent, enemy, attack, 1, "agent", "enemy")
+    assert status is None
+
+    # Prone target attacked from range -> disadvantage (not advantage)
+    agent.conditions.discard("prone")
+    enemy.is_dodging = False
+    status, _ = dnd_env._resolve_attack_modifiers(agent, enemy, attack, 3, "agent", "enemy")
+    assert status == 'disadvantage'
+
+
+@pytest.fixture
+def scout_vs_wall_env():
+    """Scout agent vs an unhittable, harmless enemy for multiattack tests."""
+    tough_enemy = {
+        "ac": 100, "max_hp": 50, "speed_total": 6,
+        "attacks": [], "bonus_actions": []
+    }
+    env = DnDCombatEnv(map_width=10, map_height=10,
+                       agent_stats=_scout_stats(), enemy_stats=tough_enemy,
+                       render_mode=None)
+    env.reset(seed=300)
+    env.agent.position = [0, 0]
+    env.enemy.position = [0, 1]  # adjacent
+    return env
+
+
+def test_multiattack_grants_two_attacks(scout_vs_wall_env):
+    env = scout_vs_wall_env
+    shortsword_idx = find_action(env, "attack_shortsword")
+
+    obs, _, _, _, info = env.step(shortsword_idx)
+    assert info["agent_attack_outcome"] == "Miss."  # AC 100 is unhittable
+    assert env.agent.attacks_remaining == 1
+    assert obs["agent_attacks_remaining_norm"][0] == pytest.approx(0.5)
+
+    obs, _, _, _, info = env.step(shortsword_idx)
+    assert info["agent_attack_outcome"] == "Miss."
+    assert env.agent.attacks_remaining == 0
+
+    # Third attack: the Attack action is spent and no slots remain
+    obs, _, _, _, info = env.step(shortsword_idx)
+    assert info["agent_attack_outcome"] == "Action already used."
+
+
+def test_multiattack_type_lock(scout_vs_wall_env):
+    env = scout_vs_wall_env
+    shortsword_idx = find_action(env, "attack_shortsword")
+    longbow_idx = find_action(env, "attack_longbow")
+
+    env.step(shortsword_idx)  # first attack locks Multiattack to melee
+    obs, _, _, _, info = env.step(longbow_idx)
+    assert info["agent_attack_outcome"] == "Wrong attack type for Multiattack."
+    assert env.agent.attacks_remaining == 1  # slot not consumed by the refusal
+
+    # The locked-in type still works
+    obs, _, _, _, info = env.step(shortsword_idx)
+    assert info["agent_attack_outcome"] == "Miss."
+    assert env.agent.attacks_remaining == 0
+
+
+def test_turn_does_not_end_with_attacks_remaining(scout_vs_wall_env):
+    env = scout_vs_wall_env
+    # Even with no speed and no bonus actions, a remaining attack slot keeps the turn alive.
+    env.agent.used_action_this_turn = True
+    env.agent.speed_remaining = 0
+    env.agent.attacks_remaining = 1
+    assert env._turn_economy_exhausted(env.agent) is False
+    env.agent.attacks_remaining = 0
+    assert env._turn_economy_exhausted(env.agent) is True
+
+
+def test_long_range_disadvantage():
+    tough_enemy = {"ac": 100, "max_hp": 50, "speed_total": 6, "attacks": [], "bonus_actions": []}
+    env = DnDCombatEnv(map_width=40, map_height=40,
+                       agent_stats=_scout_stats(), enemy_stats=tough_enemy,
+                       render_mode=None)
+    env.reset(seed=301)
+    env.agent.position = [0, 0]
+    env.enemy.position = [35, 0]  # beyond longbow normal range (30), within long (120)
+    longbow_idx = find_action(env, "attack_longbow")
+
+    obs, _, _, _, info = env.step(longbow_idx)
+    assert "long range" in info.get("agent_attack_modifier", "").lower()
+    assert info["agent_attack_outcome"] != "Out of range."
+
+    # Beyond long range the attack is simply invalid
+    env2 = DnDCombatEnv(map_width=100, map_height=100,
+                        agent_stats=_scout_stats(), enemy_stats=tough_enemy,
+                        render_mode=None)
+    env2.reset(seed=302)
+    env2.agent.position = [0, 0]
+    env2.enemy.position = [99, 30]  # distance 129 > 120
+    obs, _, _, _, info = env2.step(find_action(env2, "attack_longbow"))
+    assert info["agent_attack_outcome"] == "Out of range."
+
+
+def test_wolf_bite_knocks_prone():
+    commoner_like = {"ac": 10, "max_hp": 10, "speed_total": 6,
+                     "attacks": [], "bonus_actions": []}
+    env = DnDCombatEnv(map_width=10, map_height=10,
+                       agent_stats=_wolf_stats(), enemy_stats=commoner_like,
+                       render_mode=None)
+    env.reset(seed=303)
+    env.agent.position = [0, 0]
+    env.enemy.position = [0, 1]
+
+    # Scripted dice: attack d20=20 (hit), damage=3, save d20=1 (1+0 < DC 11 -> fail)
+    env.dice_roller = make_roller([20, 3, 1])
+    obs, _, _, _, info = env.step(find_action(env, "attack_bite"))
+
+    assert "Hit" in info["agent_attack_outcome"]
+    assert env.enemy.has_condition("prone")
+    assert "failed" in info["agent_rider_outcome"]
+    assert obs["enemy_is_prone"][0] == 1.0
+
+    # Same setup but the save succeeds: d20=11 (11+0 >= 11)
+    env.reset(seed=304)
+    env.agent.position = [0, 0]
+    env.enemy.position = [0, 1]
+    env.dice_roller = make_roller([20, 3, 11])
+    obs, _, _, _, info = env.step(find_action(env, "attack_bite"))
+    assert not env.enemy.has_condition("prone")
+    assert "succeeded" in info["agent_rider_outcome"]
+
+
+def test_prone_crawl_and_stand_up(dnd_env):
+    dnd_env.reset(seed=305)
+    agent = dnd_env.agent  # speed_total 6
+    agent.position = [5, 5]
+    dnd_env.enemy.position = [0, 0]  # far away, no OA interference
+
+    move_e_idx = find_action(dnd_env, "move_E")
+    stand_up_idx = find_action(dnd_env, "stand_up")
+
+    # stand_up while not prone is an invalid action
+    obs, reward, _, _, info = dnd_env.step(stand_up_idx)
+    assert "not prone" in info["agent_action_details"]
+
+    # Crawling while prone costs double
+    agent.conditions.add("prone")
+    speed_before = agent.speed_remaining
+    obs, _, _, _, info = dnd_env.step(move_e_idx)
+    assert agent.speed_remaining == speed_before - 2
+
+    # Standing up costs half total speed and clears prone
+    speed_before = agent.speed_remaining
+    obs, _, _, _, info = dnd_env.step(stand_up_idx)
+    assert not agent.has_condition("prone")
+    assert agent.speed_remaining == speed_before - 3  # 6 // 2
+    assert obs["agent_is_prone"][0] == 0.0
+
+
+def test_observation_mirrors_conditions(dnd_env):
+    dnd_env.reset(seed=306)
+    dnd_env.agent.conditions.add("prone")
+    dnd_env.enemy.is_dodging = True
+
+    obs = dnd_env._get_obs()
+    assert obs["agent_is_prone"][0] == 1.0
+    assert obs["enemy_is_dodging"][0] == 1.0
+
+    enemy_obs = dnd_env._get_enemy_observation()
+    # From the enemy's perspective the roles flip
+    assert enemy_obs["enemy_is_prone"][0] == 1.0
+    assert enemy_obs["agent_is_dodging"][0] == 1.0
+    assert set(enemy_obs.keys()) == set(obs.keys())
+
+
+# --- Tests for Phase 2/3 mechanics: Hide/Search, Nimble Escape, Shove, Grapple ---
+
+from bestiary.goblin import get_goblin_stats as _goblin_stats
+from bestiary.guard import get_guard_stats as _guard_stats
+
+WATCHER = {"ac": 10, "max_hp": 20, "speed_total": 6, "attacks": [], "bonus_actions": []}
+
+
+def test_hide_attack_reveals():
+    # Goblin (Stealth +6) vs a watcher with passive Perception 10
+    env = DnDCombatEnv(map_width=10, map_height=10,
+                       agent_stats=_goblin_stats(), enemy_stats=dict(WATCHER),
+                       render_mode=None)
+    env.reset(seed=400)
+    env.agent.position = [0, 0]
+    env.enemy.position = [5, 5]
+
+    # Stealth d20=5 -> 5+6=11 >= 10 -> hidden
+    env.dice_roller = make_roller([5])
+    obs, _, _, _, info = env.step(find_action(env, "hide"))
+    assert env.agent.has_condition("hidden")
+    assert obs["agent_is_hidden"][0] == 1.0
+    assert "Hidden" in info["agent_hide_outcome"]
+
+    # Hiding again while hidden is invalid (action already used anyway)
+    obs, _, _, _, info = env.step(find_action(env, "hide"))
+    assert "already used" in info["agent_action_details"] or "already hidden" in info["agent_action_details"]
+
+    # Attacking from hiding: advantage on the roll, then revealed (hit or miss)
+    env2 = DnDCombatEnv(map_width=10, map_height=10,
+                        agent_stats=_goblin_stats(), enemy_stats=dict(WATCHER),
+                        render_mode=None)
+    env2.reset(seed=401)
+    env2.agent.position = [0, 0]
+    env2.enemy.position = [5, 5]
+    env2.agent.conditions.add("hidden")
+    # advantage roll (2d20kh1)=18 -> hit vs AC 10; damage=2
+    env2.dice_roller = make_roller([18, 2])
+    obs, _, _, _, info = env2.step(find_action(env2, "attack_shortbow"))
+    assert "attacks from hiding, advantage" in info["agent_attack_modifier"]
+    assert not env2.agent.has_condition("hidden")
+    assert info["agent_hidden_revealed"] == "Revealed by attacking."
+
+
+def test_hide_requires_distance_and_adjacency_reveals():
+    env = DnDCombatEnv(map_width=10, map_height=10,
+                       agent_stats=_goblin_stats(), enemy_stats=dict(WATCHER),
+                       render_mode=None)
+    env.reset(seed=402)
+    env.agent.position = [0, 0]
+    env.enemy.position = [0, 1]  # adjacent
+
+    obs, _, _, _, info = env.step(find_action(env, "hide"))
+    assert not env.agent.has_condition("hidden")
+    assert "cannot hide while adjacent" in info["agent_action_details"]
+    assert not env.agent.used_action_this_turn  # invalid attempt costs nothing
+
+    # Hidden creature moving adjacent to its enemy is revealed
+    env.reset(seed=403)
+    env.agent.position = [0, 2]
+    env.enemy.position = [0, 0]
+    env.agent.conditions.add("hidden")
+    move_n_idx = next(i for i, a in enumerate(env.action_map) if a["name"] == "move_N")
+    obs, _, _, _, info = env.step(move_n_idx)  # to [0,1], adjacent to enemy
+    assert not env.agent.has_condition("hidden")
+    assert info["agent_hidden_revealed"] == "Revealed by adjacency."
+
+
+def test_search_with_keen_senses():
+    # Wolf seeker: Perception +3 and keen senses (advantage -> 2d20kh1)
+    hider = {"ac": 10, "max_hp": 20, "speed_total": 6, "attacks": [], "bonus_actions": [],
+             "skills": {"stealth": 6}}
+    env = DnDCombatEnv(map_width=10, map_height=10,
+                       agent_stats=_wolf_stats(), enemy_stats=hider,
+                       render_mode=None)
+    env.reset(seed=404)
+    env.agent.position = [0, 0]
+    env.enemy.position = [5, 5]
+    env.enemy.conditions.add("hidden")
+
+    # Perception (2d20kh1)=14 -> 14+3=17 vs DC 10+6=16 -> found
+    env.dice_roller = make_roller([14])
+    obs, _, _, _, info = env.step(find_action(env, "search"))
+    assert not env.enemy.has_condition("hidden")
+    assert "Found" in info["agent_search_outcome"]
+
+    # Failed search leaves the target hidden
+    env.reset(seed=405)
+    env.agent.position = [0, 0]
+    env.enemy.position = [5, 5]
+    env.enemy.conditions.add("hidden")
+    env.dice_roller = make_roller([10])  # 10+3=13 < 16
+    obs, _, _, _, info = env.step(find_action(env, "search"))
+    assert env.enemy.has_condition("hidden")
+    assert "failed" in info["agent_search_outcome"].lower()
+
+    # Searching with nothing hidden is an invalid action
+    env.reset(seed=406)
+    env.enemy.conditions.discard("hidden")
+    obs, _, _, _, info = env.step(find_action(env, "search"))
+    assert "nothing is hidden" in info["agent_action_details"]
+    assert not env.agent.used_action_this_turn
+
+
+def test_nimble_escape_bonus_actions():
+    env = DnDCombatEnv(map_width=10, map_height=10,
+                       agent_stats=_goblin_stats(), enemy_stats=dict(WATCHER),
+                       render_mode=None)
+    names = [a["name"] for a in env.action_map]
+    assert "bonus_disengage" in names and "bonus_hide" in names
+
+    # Creatures without the trait don't get the actions
+    env_plain = DnDCombatEnv(map_width=10, map_height=10,
+                             agent_stats=dict(WATCHER), enemy_stats=dict(WATCHER),
+                             render_mode=None)
+    plain_names = [a["name"] for a in env_plain.action_map]
+    assert "bonus_disengage" not in plain_names and "bonus_hide" not in plain_names
+
+    env.reset(seed=407)
+    env.agent.position = [0, 0]
+    env.enemy.position = [0, 1]
+
+    # Bonus-action Disengage costs the bonus action, not the Action
+    obs, _, _, _, info = env.step(find_action(env, "bonus_disengage"))
+    assert env.agent.is_disengaging
+    assert env.agent.used_bonus_action_this_turn
+    assert not env.agent.used_action_this_turn
+
+    # A second bonus action the same turn is refused
+    obs, _, _, _, info = env.step(find_action(env, "bonus_hide"))
+    assert "already used" in info["agent_action_details"]
+
+    # bonus_hide while adjacent is invalid (fresh turn)
+    env.reset(seed=420)
+    env.agent.position = [0, 0]
+    env.enemy.position = [0, 1]
+    obs, _, _, _, info = env.step(find_action(env, "bonus_hide"))
+    assert "cannot hide while adjacent" in info["agent_action_details"]
+    assert not env.agent.used_bonus_action_this_turn  # invalid attempt costs nothing
+
+    # bonus_hide at distance works and leaves the Action free
+    env.reset(seed=408)
+    env.agent.position = [0, 0]
+    env.enemy.position = [5, 5]
+    env.dice_roller = make_roller([5])  # 5+6=11 >= 10 -> hidden
+    obs, _, _, _, info = env.step(find_action(env, "bonus_hide"))
+    assert env.agent.has_condition("hidden")
+    assert env.agent.used_bonus_action_this_turn
+    assert not env.agent.used_action_this_turn
+
+
+def test_shove_prone_and_push():
+    # Guard (STR 13 -> +1) vs watcher (best of STR/DEX -> +0)
+    env = DnDCombatEnv(map_width=10, map_height=10,
+                       agent_stats=_guard_stats(), enemy_stats=dict(WATCHER),
+                       render_mode=None)
+    env.reset(seed=409)
+    env.agent.position = [0, 0]
+    env.enemy.position = [0, 1]
+
+    # Contest: initiator d20=15 (+1)=16 vs defender d20=5 (+0)=5 -> win
+    env.dice_roller = make_roller([15, 5])
+    obs, _, _, _, info = env.step(find_action(env, "shove_prone"))
+    assert env.enemy.has_condition("prone")
+    assert env.agent.used_action_this_turn and env.agent.attacks_remaining == 0
+    assert "prone" in info["agent_contest_outcome"]
+
+    # Push: enemy shoved one cell directly away
+    env.reset(seed=410)
+    env.agent.position = [0, 0]
+    env.enemy.position = [0, 1]
+    env.dice_roller = make_roller([15, 5])
+    obs, _, _, _, info = env.step(find_action(env, "shove_push"))
+    assert env.enemy.position == [0, 2]
+
+    # Push against the map edge: contest won but nowhere to go
+    env.reset(seed=411)
+    env.agent.position = [0, 8]
+    env.enemy.position = [0, 9]
+    env.dice_roller = make_roller([15, 5])
+    obs, _, _, _, info = env.step(find_action(env, "shove_push"))
+    assert env.enemy.position == [0, 9]
+    assert "nowhere to go" in info["agent_contest_outcome"]
+
+    # Losing the contest changes nothing
+    env.reset(seed=412)
+    env.agent.position = [0, 0]
+    env.enemy.position = [0, 1]
+    env.dice_roller = make_roller([5, 15])
+    obs, _, _, _, info = env.step(find_action(env, "shove_prone"))
+    assert not env.enemy.has_condition("prone")
+    assert "failed" in info["agent_contest_outcome"].lower()
+
+    # Shove out of reach is invalid and costs nothing
+    env.reset(seed=413)
+    env.agent.position = [0, 0]
+    env.enemy.position = [5, 5]
+    obs, _, _, _, info = env.step(find_action(env, "shove_prone"))
+    assert "out of reach" in info["agent_action_details"]
+    assert not env.agent.used_action_this_turn
+
+
+def test_grapple_escape_and_auto_release():
+    env = DnDCombatEnv(map_width=10, map_height=10,
+                       agent_stats=_guard_stats(), enemy_stats=dict(WATCHER),
+                       render_mode=None)
+    env.reset(seed=414)
+    env.agent.position = [0, 0]
+    env.enemy.position = [0, 1]
+
+    # Grapple: initiator 15+1 vs defender 5+0 -> enemy grappled
+    env.dice_roller = make_roller([15, 5])
+    obs, _, _, _, info = env.step(find_action(env, "grapple"))
+    assert env.enemy.has_condition("grappled")
+    assert obs["enemy_is_grappled"][0] == 1.0
+
+    # A grappled creature cannot move
+    move_info = {}
+    _, _, moved = env._execute_micro_action(
+        env.enemy, env.agent, {"type": "move", "delta": (0, 1), "name": "move_S"}, move_info, 'enemy')
+    assert moved is False
+    assert move_info["enemy_move_outcome"] == "Cannot move while grappled."
+
+    # Escaping: escaper best-of(STR/DEX) +0 vs grappler Athletics +1; 18 vs 2 -> free
+    env.dice_roller = make_roller([18, 2])
+    escape_info = {}
+    _, _, escaped = env._execute_micro_action(
+        env.enemy, env.agent, {"type": "escape_grapple", "name": "escape_grapple"}, escape_info, 'enemy')
+    assert escaped is True
+    assert not env.enemy.has_condition("grappled")
+    assert "Escaped" in escape_info["enemy_contest_outcome"]
+
+    # Auto-release: grappler walking out of reach frees the target
+    env.reset(seed=415)
+    env.agent.position = [0, 1]
+    env.enemy.position = [0, 2]
+    env.enemy.conditions.add("grappled")
+    move_n_idx = next(i for i, a in enumerate(env.action_map) if a["name"] == "move_N")
+    obs, _, _, _, info = env.step(move_n_idx)  # agent to [0,0], distance now 2
+    assert not env.enemy.has_condition("grappled")
+    assert "out of reach" in info["enemy_grapple_released"]
+
+
+def test_rule_based_enemy_searches_for_hidden_agent():
+    env = DnDCombatEnv(map_width=10, map_height=10,
+                       agent_stats=_goblin_stats(), enemy_stats=_wolf_stats(),
+                       render_mode=None)
+    env.reset(seed=416)
+    env.agent.position = [0, 0]
+    env.enemy.position = [9, 9]
+    env.agent.conditions.add("hidden")
+
+    end_idx = next(i for i, a in enumerate(env.action_map) if a["type"] == "end_turn")
+    obs, _, _, _, info = env.step(end_idx)
+    # Wolf spent its action searching (keen senses give it advantage)
+    assert "enemy_search_outcome" in info or not env.agent.has_condition("hidden")
+
+
+# --- Tests for action masking (MaskablePPO support) ---
+
+def test_action_masks_reflect_state(dnd_env):
+    dnd_env.reset(seed=500)
+    agent = dnd_env.agent
+    agent.position = [5, 5]
+    dnd_env.enemy.position = [5, 6]  # adjacent
+
+    def mask_for(name):
+        return bool(dnd_env.action_masks()[find_action(dnd_env, name)])
+
+    # Fresh turn, adjacent enemy
+    assert mask_for("attack_longsword")
+    assert mask_for("dash") and mask_for("dodge") and mask_for("disengage")
+    assert mask_for("grapple") and mask_for("shove_prone") and mask_for("shove_push")
+    assert not mask_for("hide")            # adjacent
+    assert not mask_for("search")          # nothing hidden
+    assert not mask_for("stand_up")        # not prone
+    assert not mask_for("escape_grapple")  # not grappled
+    assert not mask_for("move_S")          # enemy occupies [5,6]
+    assert mask_for("move_N")
+    assert mask_for("end_turn")
+
+    # After the Action is spent (no Multiattack slots left)
+    agent.used_action_this_turn = True
+    agent.attacks_remaining = 0
+    assert not mask_for("attack_longsword")
+    assert not mask_for("dash")
+    assert not mask_for("grapple")
+    assert mask_for("end_turn")
+
+    # Grappled: no moves, escape available with a fresh Action
+    agent.used_action_this_turn = False
+    agent.conditions.add("grappled")
+    assert not mask_for("move_N")
+    assert mask_for("escape_grapple")
+    agent.conditions.discard("grappled")
+
+    # Prone with 1 movement left: cannot stand (costs 3) or crawl (costs 2)
+    agent.conditions.add("prone")
+    agent.speed_remaining = 1
+    assert not mask_for("stand_up")
+    assert not mask_for("move_N")
+    agent.speed_remaining = 6
+    assert mask_for("stand_up")
+
+    # Hidden enemy makes search valid; distance makes hide valid
+    agent.conditions.discard("prone")
+    dnd_env.enemy.conditions.add("hidden")
+    dnd_env.enemy.position = [9, 9]
+    assert mask_for("search")
+    assert mask_for("hide")
+
+
+def test_masked_valid_actions_always_execute(dnd_env):
+    """Property check: any action the mask marks valid must be accepted by the
+    executor (mask and executor validity rules must never drift apart)."""
+    import random as _random
+    _random.seed(99)
+    dnd_env.reset(seed=501)
+    end_turn_idx = find_action(dnd_env, "end_turn")
+
+    for i in range(300):
+        mask = dnd_env.action_masks()
+        valid_ids = [j for j, ok in enumerate(mask) if ok]
+        assert valid_ids, "mask must never be all-False (end_turn is always legal)"
+        action = _random.choice(valid_ids)
+        decoded = dnd_env._decode_action(action)
+
+        check_info = {}
+        _, terminated, success = dnd_env._execute_micro_action(
+            dnd_env.agent, dnd_env.enemy, decoded, check_info, 'agent')
+        assert success or terminated, (
+            f"masked-valid action {decoded['name']} was refused: {check_info}")
+
+        if terminated or not dnd_env.enemy.is_alive:
+            dnd_env.reset(seed=502 + i)
+        elif action == end_turn_idx or dnd_env._turn_economy_exhausted(dnd_env.agent):
+            # Simulate the turn handover so state keeps evolving
+            dnd_env.agent.start_new_turn()

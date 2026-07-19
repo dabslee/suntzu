@@ -1,175 +1,175 @@
-import sys
+"""Watch two combatants fight, one micro-action per rendered frame.
+
+Unlike training (where env.step() runs one agent micro-action plus the
+opponent's entire turn internally), this viewer drives BOTH sides itself at
+micro-action granularity via the env's spectator API. Each side is treated
+identically — Agent 1 and Agent 2 — and every micro-action (including each of
+the opponent's moves) produces its own frame and log line.
+
+Each side is model-controlled if a model path is given and loads, otherwise it
+acts randomly (sampling from the legal-action mask).
+"""
 import os
 import argparse
-from typing import Optional # For type hinting
-from stable_baselines3 import DQN
+from typing import Optional
+
+import numpy as np
 from gymnasium.wrappers import FlattenObservation
 from gymnasium.utils.env_checker import check_env
 
-from dnd_gym_env import DnDCombatEnv 
-from bestiary.commoner import get_commoner_stats
-from bestiary.wolf import get_wolf_stats
-from bestiary.bandit import get_bandit_stats
+import bestiary
+from dnd_gym_env import DnDCombatEnv, load_model_any, MASKABLE_AVAILABLE
+try:
+    from sb3_contrib import MaskablePPO
+except ImportError:
+    class MaskablePPO: pass
 
-MODEL_PATH = "dnd_dqn_agent.zip" # Default path for the agent's model
+CREATURES = ["bandit", "cat", "commoner", "goblin", "guard", "scout", "wolf"]
 
-def main(agent_control_arg: str, 
-         agent_model_path_arg: Optional[str], 
-         enemy_model_path_arg: Optional[str], 
-         export_frames_path_arg: Optional[str]):
-    """
-    Runs the D&D Combat Environment with specified agent and enemy control types.
-    """
-    print(f"\n--- Running D&D Combat Environment ---")
-    print(f"Agent control: {agent_control_arg}")
-    if agent_control_arg == "model":
-        # Use agent_model_path_arg if provided, otherwise default to MODEL_PATH
-        # This logic is slightly changed: agent_model_path_arg already has a default from argparse
-        print(f"Agent model path: {agent_model_path_arg}")
-    
-    if enemy_model_path_arg:
-        print(f"Enemy model path: {enemy_model_path_arg} (environment will attempt to load)")
-    else:
-        print("Enemy using rule-based AI.")
-    print(f"Frame export path: {export_frames_path_arg if export_frames_path_arg else 'Disabled'}")
-    print("------------------------------------")
 
-    agent_stats = get_bandit_stats()
-    enemy_stats = get_wolf_stats()
+def get_stats(creature_name: str) -> dict:
+    return getattr(bestiary, f"get_{creature_name}_stats")()
 
-    # Create the raw environment - this instance will be used throughout.
+
+def load_side(model_path: Optional[str], label: str):
+    """Return (model_or_None, uses_masks). None means a random policy."""
+    if not model_path:
+        print(f"{label}: random policy")
+        return None, False
+    if not os.path.exists(model_path):
+        print(f"{label}: model path '{model_path}' not found -> random policy")
+        return None, False
+    try:
+        model = load_model_any(model_path)
+    except Exception as e:
+        print(f"{label}: failed to load model ({e}) -> random policy")
+        return None, False
+    uses_masks = MASKABLE_AVAILABLE and isinstance(model, MaskablePPO)
+    print(f"{label}: model {model_path} ({type(model).__name__}"
+          f"{', masked' if uses_masks else ''})")
+    return model, uses_masks
+
+
+def main(agent1_creature: str, agent2_creature: str,
+         agent1_model_path: Optional[str], agent2_model_path: Optional[str],
+         export_frames_path: Optional[str], seed: int, max_rounds: int):
+    print(f"\n--- Watching D&D Combat ---")
+    print(f"Matchup: Agent 1 ({agent1_creature}) vs Agent 2 ({agent2_creature})")
+
     env = DnDCombatEnv(
         map_width=10, map_height=10,
-        agent_stats=agent_stats, enemy_stats=enemy_stats,
+        agent_stats=get_stats(agent1_creature),   # Agent 1 fills the 'agent' seat
+        enemy_stats=get_stats(agent2_creature),   # Agent 2 fills the 'enemy' seat
         render_mode='human',
-        export_frames_path=export_frames_path_arg,
-        enemy_model_path=enemy_model_path_arg # Pass enemy model path
+        export_frames_path=export_frames_path,
+        enemy_model_path=None,                     # both sides are driven here, not internally
     )
-    print("Environment instantiated.")
 
-    # Run Environment Checker on the raw environment
     try:
         print("\nRunning Environment Checker...")
-        check_env(env) 
+        env.export_frames_path = None  # don't export the checker's throwaway frames
+        check_env(env)
+        env.export_frames_path = export_frames_path
         print("Environment check passed successfully!")
     except Exception as e:
         print(f"Environment check failed: {e}")
         env.close()
         return
 
-    agent_model = None # For the main agent
-    flatten_wrapper = FlattenObservation(env) # Wrapper for the main env, used if agent is model-controlled
+    flatten = FlattenObservation(env)  # same obs schema for both sides
+    model1, masks1 = load_side(agent1_model_path, "Agent 1")
+    model2, masks2 = load_side(agent2_model_path, "Agent 2")
+    sides = {
+        'agent': ("Agent 1", model1, masks1),
+        'enemy': ("Agent 2", model2, masks2),
+    }
 
-    if agent_control_arg == "model":
-        # Use agent_model_path_arg which has a default from argparse
-        if agent_model_path_arg and os.path.exists(agent_model_path_arg):
-            print(f"Loading agent model from: {agent_model_path_arg}")
-            try:
-                agent_model = DQN.load(agent_model_path_arg)
-                print("Agent model loaded.")
-            except Exception as e:
-                print(f"Error loading agent model: {e}. Agent will use random actions.")
-                agent_model = None # Ensure agent_model is None if loading failed
+    rng = np.random.default_rng(seed)
+
+    def choose_action(prefix: str) -> int:
+        _, model, uses_masks = sides[prefix]
+        mask = env.action_mask_for(prefix)
+        if model is None:
+            return int(rng.choice(np.flatnonzero(mask)))
+        flat_obs = flatten.observation(env.observation_for(prefix))
+        if uses_masks:
+            action, _ = model.predict(flat_obs, deterministic=True, action_masks=mask)
         else:
-            print(f"Agent model path '{agent_model_path_arg}' not found or not specified. Agent will use random actions.")
-            # agent_control_arg will remain "model" but agent_model will be None, leading to random actions.
+            action, _ = model.predict(flat_obs, deterministic=True)
+        return int(np.asarray(action).item())
 
-    effective_agent_control = "model" if agent_model else "random"
-    print(f"\nStarting interaction loop with {effective_agent_control} agent...")
-    
-    try:
-        obs_dict, info = env.reset(seed=42) 
-    except Exception as e:
-        print(f"Error during env.reset(): {e}")
-        env.close()
-        return
-        
-    env.render() 
+    obs, info = env.reset(seed=seed)
+    env.event_log.clear()  # drop check_env's throwaway steps from the panel
+    env.render()
+    events_printed = 0
 
-    max_run_steps = 150 
-    for step_num in range(max_run_steps):
-        print(f"\n--- Step {step_num + 1} ---")
+    def flush_events():
+        nonlocal events_printed
+        for line in list(env.event_log)[events_printed:]:
+            print(f"  {line}")
+        events_printed = len(env.event_log)
+        print(f"    Agent 1 ({env.agent.display_name}) "
+              f"HP {env.agent.current_hp}/{env.agent.max_hp} @ {env.agent.position} | "
+              f"Agent 2 ({env.enemy.display_name}) "
+              f"HP {env.enemy.current_hp}/{env.enemy.max_hp} @ {env.enemy.position}")
 
-        action = None
-        action_source_info = "" # For printing the source of the action
-
-        if agent_model: # Check if agent_model was successfully loaded
-            try:
-                flat_obs_for_model = flatten_wrapper.observation(obs_dict)
-                action, _ = agent_model.predict(flat_obs_for_model, deterministic=True)
-                action_source_info = f"Agent Model Action (Index {action}): {env._decode_action(action, is_enemy=False).get('name', 'Unknown')}"
-            except Exception as e:
-                print(f"Error during agent model prediction: {e}. Agent falling back to random action for this step.")
-                action = env.action_space.sample()
-                action_source_info = f"Agent (fallback to random) Action (Index {action}): {env._decode_action(action, is_enemy=False).get('name', 'Unknown')}"
-        else: # Random agent behavior (either selected or as fallback)
-            action = env.action_space.sample()
-            action_source_info = f"Random Agent Action (Index {action}): {env._decode_action(action, is_enemy=False).get('name', 'Unknown')}"
-        
-        print(action_source_info)
-
-        if action is None: 
-            print("Error: No action determined for agent. Breaking loop.")
-            break
-
-        try:
-            obs_dict, reward, terminated, truncated, info = env.step(action)
-        except Exception as e:
-            print(f"Error during env.step() with action {action}: {e}")
-            import traceback
-            traceback.print_exc()
-            break
-            
-        env.render()
-        
-        print(f"Reward: {reward:.2f}, Terminated: {terminated}, Truncated: {truncated}")
-        print(f"Agent HP: {env.agent.current_hp}, Enemy HP: {env.enemy.current_hp}")
-        print(f"Agent Pos: {env.agent.position}, Enemy Pos: {env.enemy.position}")
-        print(f"Steps taken in episode: {env.current_episode_steps}")
-
-
-        if terminated or truncated:
-            print("\nEpisode finished!")
+    terminated = False
+    for round_num in range(max_rounds):
+        for prefix in ('agent', 'enemy'):  # Agent 1 acts, then Agent 2
+            actor = env._side(prefix)[0]
+            if not actor.can_act():
+                continue
+            env.begin_turn(prefix)
+            for _ in range(env._max_micro_steps(actor)):
+                action_id = choose_action(prefix)
+                terminated, turn_over, _ = env.spectator_step(prefix, action_id)
+                env.render()
+                flush_events()
+                if terminated or turn_over:
+                    break
             if terminated:
-                if env.agent.is_alive and not env.enemy.is_alive: print("Result: Agent Won!")
-                elif not env.agent.is_alive: print("Result: Agent Lost!")
-                else: print("Result: Terminated for other reasons.")
-            if truncated:
-                print(f"Result: Draw (reached max {env.max_episode_steps} steps).")
-            
-            # Option to run more episodes or break
-            # For now, break after one episode in this script's run
-            break 
-    
-    if step_num == max_run_steps - 1 and not (terminated or truncated):
-        print(f"\nReached max run steps ({max_run_steps}) for this interaction without termination/truncation.")
+                break
+        if terminated:
+            break
+
+    print("\nEpisode finished!")
+    if terminated:
+        if env.agent.is_alive and not env.enemy.is_alive:
+            print(f"Result: Agent 1 ({env.agent.display_name}) won!")
+        elif not env.agent.is_alive and env.enemy.is_alive:
+            print(f"Result: Agent 2 ({env.enemy.display_name}) won!")
+        else:
+            print("Result: Both down — draw.")
+    else:
+        print(f"Result: Draw (reached max {max_rounds} rounds).")
 
     env.close()
     print("\nEnvironment closed.")
 
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Run D&D Combat Environment")
-    parser.add_argument("--agent_control", type=str, default="random", choices=["random", "model"],
-                        help="Control type for the agent. Default: random")
-    parser.add_argument("--agent_model_path", type=str, default="dnd_dqn_agent.zip",
-                        help="Path to agent's DRL model (used if --agent_control=model).")
-    parser.add_argument("--enemy_model_path", type=str, default=None,
-                        help="Path to enemy's DRL model. If None, rule-based AI is used by the environment.")
-    parser.add_argument("--export_frames_path", type=str, default=None, 
-                        help="Path to directory to save rendered frames. If not set, frames are not saved.")
+    parser = argparse.ArgumentParser(description="Watch two D&D combatants fight (symmetric spectator view)")
+    parser.add_argument("--agent1_creature", type=str, default="bandit", choices=CREATURES,
+                        help="Bestiary creature for Agent 1. Default: bandit")
+    parser.add_argument("--agent2_creature", type=str, default="wolf", choices=CREATURES,
+                        help="Bestiary creature for Agent 2. Default: wolf")
+    parser.add_argument("--agent1_model", type=str, default=None,
+                        help="Path to Agent 1's model. If omitted/not found, Agent 1 acts randomly.")
+    parser.add_argument("--agent2_model", type=str, default=None,
+                        help="Path to Agent 2's model. If omitted/not found, Agent 2 acts randomly.")
+    parser.add_argument("--export_frames_path", type=str, default=None,
+                        help="Directory to save a PNG per micro-action. If unset, frames are not saved.")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for placement and random policies.")
+    parser.add_argument("--max_rounds", type=int, default=60,
+                        help="Max full rounds (Agent 1 turn + Agent 2 turn) before declaring a draw.")
     args = parser.parse_args()
-    
-    # Assuming dnd_gym_env.py, bestiary/*, and dice.py are structured to be found.
-    # The call to main will be updated in the next step to use these new args.
-    # For now, to keep the script runnable, we'll pass what main currently expects,
-    # or comment out the main call if its signature changes drastically.
-    # Current main signature: main(agent_type: str, export_frames_path_arg: Optional[str])
-    # We will map the new args to the old main signature for now.
-    # This will be properly fixed in the next subtask.
-    agent_type_for_main = "trained" if args.agent_control == "model" else "random"
+
     main(
-        agent_control_arg=args.agent_control,
-        agent_model_path_arg=args.agent_model_path,
-        enemy_model_path_arg=args.enemy_model_path,
-        export_frames_path_arg=args.export_frames_path
+        agent1_creature=args.agent1_creature,
+        agent2_creature=args.agent2_creature,
+        agent1_model_path=args.agent1_model,
+        agent2_model_path=args.agent2_model,
+        export_frames_path=args.export_frames_path,
+        seed=args.seed,
+        max_rounds=args.max_rounds,
     )

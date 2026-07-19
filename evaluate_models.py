@@ -28,7 +28,11 @@ except ImportError:
         def __getattr__(self, name): return getattr(self.env, name) # Pass through other attributes
 
 
-from dnd_gym_env import DnDCombatEnv, Creature # Assuming Creature might be useful for type hints or direct use
+from dnd_gym_env import DnDCombatEnv, Creature, load_model_any, MASKABLE_AVAILABLE
+try:
+    from sb3_contrib import MaskablePPO
+except ImportError:
+    class MaskablePPO: pass
 # Bestiary imports will be dynamic based on args
 
 # Helper function to be added in evaluate_models.py
@@ -135,14 +139,15 @@ def main():
     env = FlattenObservation(env)
     print("Environment initialized and wrapped with FlattenObservation.")
 
-    # Load Model 1 (Agent)
+    # Load Model 1 (Agent) — MaskablePPO or DQN
     print(f"Loading Model 1 (Agent) from: {args.model1_path}")
     try:
-        model1 = DQN.load(args.model1_path, device='auto')
-        print("Model 1 loaded successfully.")
+        model1 = load_model_any(args.model1_path)
+        print(f"Model 1 loaded successfully ({type(model1).__name__}).")
     except Exception as e:
         print(f"Error loading Model 1 from {args.model1_path}: {e}")
         return
+    model1_uses_masks = MASKABLE_AVAILABLE and isinstance(model1, MaskablePPO)
 
     model1_wins = 0
     model2_wins = 0 # Represents wins by the 'enemy' model (Model 2)
@@ -170,7 +175,11 @@ def main():
 
 
         while not terminated and not truncated:
-            action, _ = model1.predict(obs, deterministic=True)
+            if model1_uses_masks:
+                action, _ = model1.predict(obs, deterministic=True,
+                                           action_masks=env.action_masks())
+            else:
+                action, _ = model1.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             episode_step_count += 1
 

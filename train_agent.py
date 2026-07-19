@@ -1,181 +1,147 @@
-import os
-import argparse # For command-line arguments
-from typing import Optional # For type hinting
-import gymnasium as gym 
-from stable_baselines3 import DQN
-from stable_baselines3.common.vec_env import DummyVecEnv
-# evaluate_policy was removed in a previous step, manual loop is used
-# from stable_baselines3.common.evaluation import evaluate_policy 
-from gymnasium.wrappers import FlattenObservation 
+"""Train a single MaskablePPO agent (guard vs. wolf by default) against the
+rule-based enemy AI or a saved enemy model, then evaluate it for 20 episodes.
 
-# Assuming dnd_gym_env.py and bestiary are in the same directory or accessible in PYTHONPATH
+Uses action masking + several vectorized envs (batched policy inference) —
+see README "Training performance" for why this is much faster than the old
+single-env DQN setup.
+"""
+import os
+import argparse
+from typing import Optional
+
+import gymnasium as gym
+from sb3_contrib import MaskablePPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from gymnasium.wrappers import FlattenObservation
+
 from dnd_gym_env import DnDCombatEnv
 from bestiary.guard import get_guard_stats
 from bestiary.wolf import get_wolf_stats
 
 # --- Configuration ---
 # Guard vs. wolf is a winnable matchup, so the reward signal contains wins.
-# (A commoner's 4 HP vs. a wolf is near-unwinnable and trains poorly.)
 AGENT_STATS = get_guard_stats()
 ENEMY_STATS = get_wolf_stats()
 MAP_WIDTH = 10
 MAP_HEIGHT = 10
+N_ENVS = 8
 
-LOG_DIR = "./dnd_dqn_tensorboard/"
-MODEL_SAVE_PATH = "dnd_dqn_agent.zip"
+LOG_DIR = "./dnd_ppo_tensorboard/"
+MODEL_SAVE_PATH = "dnd_ppo_agent.zip"
 
-# Ensure log directory exists
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# --- Environment Setup ---
-def make_env(enemy_model_path_arg: Optional[str] = None, render_mode_arg: Optional[str] = None):
-    """Helper function to create an environment instance."""
-    # print(f"make_env: enemy_model='{enemy_model_path_arg}', render='{render_mode_arg}'") # For debugging
-    env = DnDCombatEnv(
+
+def make_env(enemy_model_path_arg: Optional[str] = None,
+             render_mode_arg: Optional[str] = None,
+             verbose_arg: bool = True) -> DnDCombatEnv:
+    return DnDCombatEnv(
         map_width=MAP_WIDTH,
         map_height=MAP_HEIGHT,
-        agent_stats=AGENT_STATS,    # Uses global AGENT_STATS
-        enemy_stats=ENEMY_STATS,    # Uses global ENEMY_STATS
+        agent_stats=AGENT_STATS,
+        enemy_stats=ENEMY_STATS,
         render_mode=render_mode_arg,
-        enemy_model_path=enemy_model_path_arg # Pass the argument here
+        enemy_model_path=enemy_model_path_arg,
+        verbose=verbose_arg
     )
-    return env
 
-# Create a function to properly wrap the environment
-def wrap_env(env_to_wrap: gym.Env) -> gym.Env: 
-    """Flattens the dictionary observation space."""
-    wrapped_env = FlattenObservation(env_to_wrap)
-    return wrapped_env
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train DQN Agent for D&D Combat Environment.")
+    parser = argparse.ArgumentParser(description="Train MaskablePPO Agent for D&D Combat Environment.")
     parser.add_argument("--enemy_model_path", type=str, default=None,
-                        help="Path to a pre-trained DQN model for the enemy. If None, rule-based AI is used.")
-    # Potentially add other CLI args like total_timesteps, model_save_path, log_dir etc.
+                        help="Path to a pre-trained model for the enemy. If None, rule-based AI is used.")
+    parser.add_argument("--total_timesteps", type=int, default=200000,
+                        help="Total training timesteps. Default: 200000")
+    parser.add_argument("--n_envs", type=int, default=N_ENVS,
+                        help=f"Number of vectorized envs. Default: {N_ENVS}")
     args = parser.parse_args()
 
-    if args.enemy_model_path:
-        print(f"Attempting to train agent against an enemy controlled by model: {args.enemy_model_path}")
-        if not os.path.exists(args.enemy_model_path):
-             print(f"Warning: Enemy model file {args.enemy_model_path} not found! Enemy will use rule-based AI.")
-             args.enemy_model_path = None # Fallback to rule-based if model not found
-    else:
-        print("Training agent against a rule-based enemy AI.")
+    if args.enemy_model_path and not os.path.exists(args.enemy_model_path):
+        print(f"Warning: Enemy model file {args.enemy_model_path} not found! Using rule-based AI.")
+        args.enemy_model_path = None
+    print(f"Enemy: {'model ' + args.enemy_model_path if args.enemy_model_path else 'rule-based AI'}")
 
-    print("Creating and wrapping the vectorized environment for training...")
-    # Create a vectorized environment for SB3, passing the enemy_model_path
-    vec_env = DummyVecEnv([lambda: FlattenObservation(make_env(enemy_model_path_arg=args.enemy_model_path, render_mode_arg=None))])
-    print("Training environment created.")
+    print(f"Creating {args.n_envs} vectorized training environments...")
+    # VecNormalize(norm_reward=True) rescales the +/-100 terminal rewards for
+    # PPO's value function — without it PPO plateaus at ~0% wins. Observations
+    # are NOT normalized, so the saved policy works standalone at inference.
+    vec_env = VecNormalize(
+        DummyVecEnv(
+            # Only the first env copy logs its setup (they are identical)
+            [(lambda v=(i == 0): FlattenObservation(
+                make_env(enemy_model_path_arg=args.enemy_model_path, verbose_arg=v)))
+             for i in range(args.n_envs)]),
+        norm_obs=False, norm_reward=True, gamma=0.99)
 
-    # --- Model Definition ---
-    print("Defining the DQN model...")
-    model = DQN(
+    print("Defining the MaskablePPO model...")
+    model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=1, # Set to 1 to see training logs, 0 for less output
-        learning_rate=1e-4,    # 0.0001
-        buffer_size=50000,     # Size of the replay buffer
-        learning_starts=1000,  # Number of steps before learning starts
-        batch_size=32,         # Size of a batch sampled from replay buffer for training
-        tau=1.0,               # Soft update coefficient (1 for hard update)
-        gamma=0.99,            # Discount factor
-        train_freq=4,          # Update the model every 4 steps (can be int or tuple)
-        gradient_steps=1,      # How many gradient steps to perform when train_freq is met
-        exploration_fraction=0.2, # Fraction of entire training period over which exploration rate is reduced
-        exploration_final_eps=0.05, # Final value of random action probability
+        verbose=1,
+        learning_rate=3e-4,
+        n_steps=256,        # rollout length per env (n_envs * n_steps per update)
+        batch_size=512,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        ent_coef=0.01,      # entropy bonus for exploration
         tensorboard_log=LOG_DIR
     )
-    print("DQN model defined.")
 
-    # --- Training ---
-    TOTAL_TIMESTEPS = 50000 # Reduced for quicker initial testing (plan was 200k)
-    # TOTAL_TIMESTEPS = 1000 # Even shorter for a very quick smoke test
-    print(f"Starting training for {TOTAL_TIMESTEPS} timesteps...")
-    
-    model.learn(
-        total_timesteps=TOTAL_TIMESTEPS,
-        log_interval=10, # Log training info every 10 rollout collections (episodes for DQN)
-        progress_bar=True # Show a progress bar during training
-    )
+    print(f"Starting training for {args.total_timesteps} timesteps...")
+    model.learn(total_timesteps=args.total_timesteps, log_interval=10, progress_bar=True)
     print("Training complete.")
 
-    # --- Save Model ---
     print(f"Saving model to {MODEL_SAVE_PATH}...")
     model.save(MODEL_SAVE_PATH)
-    print("Model saved.")
+    vec_env.close()
 
     # --- Evaluation ---
     print("Setting up evaluation environment...")
-    # For manual evaluation loop:
-    # Pass the same enemy_model_path_arg for consistency in evaluation
-    manual_eval_env_raw = make_env(enemy_model_path_arg=args.enemy_model_path, render_mode_arg=None) 
-    manual_eval_env_wrapped = wrap_env(manual_eval_env_raw) 
-    
-    # Load the model that was just trained and saved
-    print(f"Loading model for manual evaluation from {MODEL_SAVE_PATH}...")
-    loaded_model = DQN.load(MODEL_SAVE_PATH)
+    eval_env_raw = make_env(enemy_model_path_arg=args.enemy_model_path)
+    eval_env = FlattenObservation(eval_env_raw)
 
-    num_eval_episodes = 20 
-    total_rewards_manual = 0
-    wins = 0
-    losses = 0
-    draws = 0
-    
-    print(f"\nStarting manual evaluation for {num_eval_episodes} episodes (max steps per episode: {manual_eval_env_raw.max_episode_steps})...")
+    print(f"Loading model for evaluation from {MODEL_SAVE_PATH}...")
+    loaded_model = MaskablePPO.load(MODEL_SAVE_PATH)
 
+    num_eval_episodes = 20
+    total_rewards = 0.0
+    wins = losses = draws = 0
+
+    print(f"\nEvaluating for {num_eval_episodes} episodes "
+          f"(max {eval_env_raw.max_episode_steps} steps each)...")
     for episode in range(num_eval_episodes):
-        print(f"--- Starting evaluation episode {episode + 1}/{num_eval_episodes} ---")
-        obs, info = manual_eval_env_wrapped.reset()
-        
-        terminated = False 
-        truncated = False
+        obs, info = eval_env.reset()
         done = False
-        episode_reward = 0
-        episode_steps = 0 
-
+        episode_reward = 0.0
         while not done:
-            action, _states = loaded_model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = manual_eval_env_wrapped.step(action) 
-            
-            episode_steps = manual_eval_env_raw.current_episode_steps 
-            
+            action, _ = loaded_model.predict(obs, deterministic=True,
+                                             action_masks=eval_env_raw.action_masks())
+            obs, reward, terminated, truncated, info = eval_env.step(action)
             done = terminated or truncated
             episode_reward += reward
-        
-        total_rewards_manual += episode_reward
-        print(f"Episode {episode + 1} finished after {episode_steps} steps. Reward: {episode_reward:.2f}")
+        total_rewards += episode_reward
 
-        if truncated and not terminated: 
+        if truncated and not terminated:
             draws += 1
-            print(f"Result: Draw (reached max {manual_eval_env_raw.max_episode_steps} steps). Agent HP: {manual_eval_env_raw.agent.current_hp}, Enemy HP: {manual_eval_env_raw.enemy.current_hp}")
-        elif terminated: 
-            if manual_eval_env_raw.agent.is_alive and not manual_eval_env_raw.enemy.is_alive:
-                wins += 1
-                print(f"Result: Agent Won. Agent HP: {manual_eval_env_raw.agent.current_hp}, Enemy HP: {manual_eval_env_raw.enemy.current_hp}")
-            elif not manual_eval_env_raw.agent.is_alive: 
-                losses += 1
-                print(f"Result: Agent Lost. Agent HP: {manual_eval_env_raw.agent.current_hp}, Enemy HP: {manual_eval_env_raw.enemy.current_hp}")
-            else: 
-                draws +=1 
-                print(f"Result: Undetermined (Terminated but not clear win/loss by HP - counted as draw). Agent HP: {manual_eval_env_raw.agent.current_hp}, Enemy HP: {manual_eval_env_raw.enemy.current_hp}")
+            result = "Draw (max steps)"
+        elif eval_env_raw.agent.is_alive and not eval_env_raw.enemy.is_alive:
+            wins += 1
+            result = "Agent Won"
+        elif not eval_env_raw.agent.is_alive:
+            losses += 1
+            result = "Agent Lost"
+        else:
+            draws += 1
+            result = "Draw"
+        print(f"Episode {episode + 1}: {result}. Reward: {episode_reward:.2f}. "
+              f"Agent HP: {eval_env_raw.agent.current_hp}, Enemy HP: {eval_env_raw.enemy.current_hp}")
 
-    avg_reward_manual = total_rewards_manual / num_eval_episodes if num_eval_episodes > 0 else 0
-    win_rate = wins / num_eval_episodes if num_eval_episodes > 0 else 0
-    loss_rate = losses / num_eval_episodes if num_eval_episodes > 0 else 0
-    draw_rate = draws / num_eval_episodes if num_eval_episodes > 0 else 0
+    print(f"\n--- Evaluation Summary ---")
+    print(f"Episodes: {num_eval_episodes}, Avg Reward: {total_rewards / num_eval_episodes:.2f}")
+    print(f"Wins: {wins} ({wins / num_eval_episodes:.0%}), "
+          f"Losses: {losses} ({losses / num_eval_episodes:.0%}), "
+          f"Draws: {draws} ({draws / num_eval_episodes:.0%})")
+    print(f"\nTensorBoard: tensorboard --logdir=\"{os.path.abspath(LOG_DIR)}\"")
 
-    print(f"\n--- Manual Evaluation Summary ---")
-    print(f"Total Episodes: {num_eval_episodes}")
-    print(f"Average Reward: {avg_reward_manual:.2f}")
-    print(f"Wins: {wins} ({win_rate:.2%})")
-    print(f"Losses: {losses} ({loss_rate:.2%})")
-    print(f"Draws (includes max steps and other terminated draws): {draws} ({draw_rate:.2%})")
-    print("------------------------------------")
-
-    print("\nTo view tensorboard logs, run the following command in your terminal:")
-    print(f"tensorboard --logdir=\"{os.path.abspath(LOG_DIR)}\"")
-    print("\nTraining and evaluation script example complete.")
-
-    # --- Cleanup ---
-    vec_env.close() # This is the training env
-    manual_eval_env_wrapped.close() # Close the evaluation environment
+    eval_env.close()

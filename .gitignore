@@ -25,6 +25,7 @@ Thumbs.db
 *tensorboard*/
 *.pt
 run_env_output/
+frames/
 
 # Environment variables
 .env
