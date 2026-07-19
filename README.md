@@ -19,7 +19,8 @@ alternating self-play.
 | [bestiary/](bestiary/) | Creature stat blocks (`commoner`, `wolf`, `cat`, `bandit`, `guard`, `goblin`, `scout`). Each module exposes `get_<name>_stats()` returning a dict of AC, HP, speed, attacks, and bonus actions. |
 | [train_agent.py](train_agent.py) | Trains a single MaskablePPO agent (guard vs. wolf by default) against the rule-based enemy or a saved enemy model, then runs a 20-episode evaluation. |
 | [train_alternating.py](train_alternating.py) | Alternating self-play with MaskablePPO: trains model A against the latest model B, then B against the updated A, for N iterations. |
-| [evaluate_models.py](evaluate_models.py) | Pits two saved models against each other for many episodes and reports win/loss/draw rates. |
+| [evaluate_models.py](evaluate_models.py) | Scores two policies head-to-head over many episodes, driving both sides symmetrically (same loop as the viewer). Either side may be left model-less to act randomly as a baseline; `--swap_sides` also runs the mirror matchup to cancel out the first-turn advantage. |
+| [spectator.py](spectator.py) | Shared symmetric driving loop used by `run_env.py` and `evaluate_models.py`, so what you watch is exactly what gets scored. |
 | [run_env.py](run_env.py) | Symmetric spectator: drives **both** combatants itself one micro-action at a time (via the env's spectator API), so every micro-action — including each of the opponent's moves — gets its own frame and log line. Creature-art tokens with name labels and condition badges, framed as **Agent 1** and **Agent 2**. Each side is model-controlled if given a model (`--agent1_model`/`--agent2_model`), else random. Selectable matchup (`--agent1_creature`/`--agent2_creature`), optional per-micro-action PNG export. |
 | [test_dice.py](test_dice.py), [test_dnd_gym_env.py](test_dnd_gym_env.py) | Pytest suites for the dice roller and the environment. |
 | `models/` | Saved `.zip` DQN checkpoints from past runs. **Note:** checkpoints predating the turn-structure fix (see below) were trained on broken dynamics and a different action-space size; they should be retrained. |
@@ -167,9 +168,16 @@ python train_agent.py --enemy_model_path models/wolf_v_commoner_3.zip
 # Alternating self-play (wolf vs. commoner, 10 iterations x 50k steps each)
 python train_alternating.py --agent1_stats_module bestiary.wolf --agent2_stats_module bestiary.commoner
 
-# Evaluate two saved models head-to-head
-python evaluate_models.py --model1_path models/commoner_v_wolf_3.zip --model2_path models/wolf_v_commoner_3.zip \
-    --agent_stats_module bestiary.commoner --enemy_stats_module bestiary.wolf --num_episodes 1000
+# Evaluate two saved models head-to-head (add --swap_sides for the mirror matchup)
+python evaluate_models.py \
+    --agent1_stats_module bestiary.wolf --agent2_stats_module bestiary.goblin \
+    --agent1_model models/dnd_agent1_selfplay.zip \
+    --agent2_model models/dnd_agent2_selfplay.zip --num_episodes 1000 --swap_sides
+
+# Omit a model to use a random policy on that side as a baseline
+python evaluate_models.py \
+    --agent1_stats_module bestiary.wolf --agent2_stats_module bestiary.goblin \
+    --agent1_model models/dnd_agent1_selfplay.zip --num_episodes 200
 
 # Watch an episode with pygame rendering (both sides driven one action per frame)
 python run_env.py --agent1_creature goblin --agent2_creature wolf          # both random

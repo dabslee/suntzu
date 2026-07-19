@@ -709,6 +709,14 @@ class DnDCombatEnv(gym.Env):
             return self.agent, self.enemy, self._agent_action_map
         return self.enemy, self.agent, self._enemy_action_map
 
+    def creature_for(self, prefix: str) -> Creature:
+        """The Creature occupying a seat ('agent' = Agent 1, 'enemy' = Agent 2)."""
+        return self._side(prefix)[0]
+
+    def micro_step_limit(self, prefix: str) -> int:
+        """Safety cap on micro-actions in one creature's turn."""
+        return self._max_micro_steps(self._side(prefix)[0])
+
     def observation_for(self, prefix: str) -> Dict[str, Any]:
         """Dict observation from a combatant's own perspective (same schema for
         both, so one FlattenObservation wrapper works for either side)."""

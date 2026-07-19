@@ -18,36 +18,14 @@ from gymnasium.wrappers import FlattenObservation
 from gymnasium.utils.env_checker import check_env
 
 import bestiary
-from dnd_gym_env import DnDCombatEnv, load_model_any, MASKABLE_AVAILABLE
-try:
-    from sb3_contrib import MaskablePPO
-except ImportError:
-    class MaskablePPO: pass
+import spectator
+from dnd_gym_env import DnDCombatEnv
 
 CREATURES = ["bandit", "cat", "commoner", "goblin", "guard", "scout", "wolf"]
 
 
 def get_stats(creature_name: str) -> dict:
     return getattr(bestiary, f"get_{creature_name}_stats")()
-
-
-def load_side(model_path: Optional[str], label: str):
-    """Return (model_or_None, uses_masks). None means a random policy."""
-    if not model_path:
-        print(f"{label}: random policy")
-        return None, False
-    if not os.path.exists(model_path):
-        print(f"{label}: model path '{model_path}' not found -> random policy")
-        return None, False
-    try:
-        model = load_model_any(model_path)
-    except Exception as e:
-        print(f"{label}: failed to load model ({e}) -> random policy")
-        return None, False
-    uses_masks = MASKABLE_AVAILABLE and isinstance(model, MaskablePPO)
-    print(f"{label}: model {model_path} ({type(model).__name__}"
-          f"{', masked' if uses_masks else ''})")
-    return model, uses_masks
 
 
 def main(agent1_creature: str, agent2_creature: str,
@@ -77,34 +55,23 @@ def main(agent1_creature: str, agent2_creature: str,
         return
 
     flatten = FlattenObservation(env)  # same obs schema for both sides
-    model1, masks1 = load_side(agent1_model_path, "Agent 1")
-    model2, masks2 = load_side(agent2_model_path, "Agent 2")
-    sides = {
-        'agent': ("Agent 1", model1, masks1),
-        'enemy': ("Agent 2", model2, masks2),
+    policies = {
+        'agent': spectator.load_policy(agent1_model_path, "Agent 1"),
+        'enemy': spectator.load_policy(agent2_model_path, "Agent 2"),
     }
-
     rng = np.random.default_rng(seed)
 
-    def choose_action(prefix: str) -> int:
-        _, model, uses_masks = sides[prefix]
-        mask = env.action_mask_for(prefix)
-        if model is None:
-            return int(rng.choice(np.flatnonzero(mask)))
-        flat_obs = flatten.observation(env.observation_for(prefix))
-        if uses_masks:
-            action, _ = model.predict(flat_obs, deterministic=True, action_masks=mask)
-        else:
-            action, _ = model.predict(flat_obs, deterministic=True)
-        return int(np.asarray(action).item())
-
-    obs, info = env.reset(seed=seed)
-    env.event_log.clear()  # drop check_env's throwaway steps from the panel
-    env.render()
     events_printed = 0
 
-    def flush_events():
+    def on_micro_action(prefix: Optional[str]) -> None:
+        """Render a frame and print the log for every micro-action, both sides."""
         nonlocal events_printed
+        if prefix is None:  # opening state
+            env.event_log.clear()  # drop check_env's throwaway steps from the panel
+            events_printed = 0
+            env.render()
+            return
+        env.render()
         for line in list(env.event_log)[events_printed:]:
             print(f"  {line}")
         events_printed = len(env.event_log)
@@ -113,35 +80,19 @@ def main(agent1_creature: str, agent2_creature: str,
               f"Agent 2 ({env.enemy.display_name}) "
               f"HP {env.enemy.current_hp}/{env.enemy.max_hp} @ {env.enemy.position}")
 
-    terminated = False
-    for round_num in range(max_rounds):
-        for prefix in ('agent', 'enemy'):  # Agent 1 acts, then Agent 2
-            actor = env._side(prefix)[0]
-            if not actor.can_act():
-                continue
-            env.begin_turn(prefix)
-            for _ in range(env._max_micro_steps(actor)):
-                action_id = choose_action(prefix)
-                terminated, turn_over, _ = env.spectator_step(prefix, action_id)
-                env.render()
-                flush_events()
-                if terminated or turn_over:
-                    break
-            if terminated:
-                break
-        if terminated:
-            break
+    outcome = spectator.play_episode(
+        env, flatten, policies, rng,
+        max_rounds=max_rounds, seed=seed, on_micro_action=on_micro_action)
 
     print("\nEpisode finished!")
-    if terminated:
-        if env.agent.is_alive and not env.enemy.is_alive:
-            print(f"Result: Agent 1 ({env.agent.display_name}) won!")
-        elif not env.agent.is_alive and env.enemy.is_alive:
-            print(f"Result: Agent 2 ({env.enemy.display_name}) won!")
-        else:
-            print("Result: Both down — draw.")
-    else:
+    if outcome == 'agent1':
+        print(f"Result: Agent 1 ({env.agent.display_name}) won!")
+    elif outcome == 'agent2':
+        print(f"Result: Agent 2 ({env.enemy.display_name}) won!")
+    elif env.agent.is_alive or env.enemy.is_alive:
         print(f"Result: Draw (reached max {max_rounds} rounds).")
+    else:
+        print("Result: Both down — draw.")
 
     env.close()
     print("\nEnvironment closed.")
