@@ -14,7 +14,9 @@ alternating self-play.
 
 | File / dir | Purpose |
 |---|---|
-| [sunztu/env.py](sunztu/env.py) | `DnDCombatEnv` — the Gymnasium environment: turn structure, combat rules executor, observations, action masks, opponent AIs, and the spectator API. |
+| [sunztu/rules.py](sunztu/rules.py) | `CombatRules` — the pure rules engine. Creature-indexed and N-creature-ready: resolves every micro-action (movement/OAs, attacks/Multiattack, conditions, stealth, contests) and reports what happened (`ActionResult` with damage/death events). Knows nothing about rewards, seats, observations, or RL. |
+| [sunztu/env.py](sunztu/env.py) | `DnDCombatEnv` — the Gymnasium adapter over the rules engine: binds the learner to creature index 0, translates `ActionResult` events into rewards, builds observations and action masks, orchestrates the opponent's turn, and exposes the spectator API. |
+| [sunztu/opponents.py](sunztu/opponents.py) | Opponent policies (`RuleBasedOpponent`, `ModelOpponent`): they only *choose* the next micro-action; execution goes through the same `CombatRules.execute()` path as everything else. |
 | [sunztu/creature.py](sunztu/creature.py) | The `Creature` data model: stats, action economy, conditions, attack rolls, saving throws. |
 | [sunztu/dice.py](sunztu/dice.py) | Dice-string roller, e.g. `1d8+3`, `2d20kh1` (advantage), `2d20kl1` (disadvantage). |
 | [sunztu/render.py](sunztu/render.py) | All pygame rendering (tokens, badges, stats/log panel). Only imported for `human`/`rgb_array` modes, so headless training has no pygame dependency. |
@@ -239,7 +241,10 @@ prone, Hide/Search, Nimble Escape, and Shove/Grapple — the complete
 no-ally, no-object subset of SRD standard actions for the seven bestiary
 creatures. Still missing:
 
-- Pack Tactics and Help need multi-creature combat; declared but inert.
+- Pack Tactics and Help need multi-creature combat; declared but inert. The
+  groundwork exists now — `CombatRules` is creature-indexed with target
+  selection funneled through one seam (`opponent_of`) — but the observation
+  schema, action space, and turn order are still two-combatant.
 - No critical hits/misses (a natural 20/1 is just a high/low roll), no
   diagonal movement, no terrain or obstacles (so the cat's climb speed is
   meaningless and stealth is abstracted), no Ready action, no spells.

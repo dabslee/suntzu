@@ -17,11 +17,17 @@ except ImportError:
 
 from sunztu.dice import roll
 from sunztu.creature import Creature, DEFAULT_ABILITIES
-from sunztu.models import load_model_any, MASKABLE_AVAILABLE, MaskablePPO
+from sunztu.models import load_model_any
+from sunztu.opponents import ModelOpponent, RuleBasedOpponent
+from sunztu.rules import CombatRules
 
 
 class DnDCombatEnv(gym.Env):
     metadata = {'render_modes': ['ansi', 'human', 'rgb_array'], 'render_fps': 4}
+
+    # The learner always occupies index 0 in the rules engine ('agent' seat);
+    # the opponent is index 1. Rewards are computed relative to this index.
+    LEARNER_IDX = 0
 
     def __init__(self, 
                  map_width: int, 
@@ -126,16 +132,22 @@ class DnDCombatEnv(gym.Env):
         enemy_init_stats.pop('initial_position', None)
         self.enemy = Creature(name="enemy", initial_position=[0,0], **enemy_init_stats)
         
-        self.dice_roller = roll
+        # The rules engine owns the creatures and all combat mechanics; this
+        # env is the RL adapter on top of it (rewards, observations, learner
+        # binding, opponent turn orchestration). The labels 'agent'/'enemy'
+        # are display-only — the engine itself is index-based.
+        self.rules = CombatRules([self.agent, self.enemy], ["agent", "enemy"],
+                                 self.map_width, self.map_height, dice_roller=roll)
+        self.action_space = spaces.Discrete(len(self.rules.action_maps[0]))
 
-        # Build action maps. Both are always built so either combatant can be
-        # driven at micro-action granularity (used by the internal enemy turn,
-        # by a model-controlled enemy, and by run_env's spectator loop).
-        self._agent_action_map = self._build_action_map_for_creature(self.agent)
-        self.action_space = spaces.Discrete(len(self._agent_action_map))
-        self._enemy_action_map = self._build_action_map_for_creature(self.enemy)
-        # Backwards-compatible alias (older code referenced this name).
-        self._enemy_action_map_for_validation = self._enemy_action_map
+        # The opponent seat's policy: a loaded model if one was given,
+        # otherwise the scripted rule-based AI.
+        if self.enemy_is_model_controlled and self.enemy_model and self.enemy_obs_flattener:
+            self.enemy_policy = ModelOpponent(
+                self.enemy_model,
+                lambda: self.enemy_obs_flattener.observation(self._get_enemy_observation()))
+        else:
+            self.enemy_policy = RuleBasedOpponent()
         
         # Define Observation Space
         max_coord = max(self.map_width, self.map_height) -1
@@ -245,200 +257,43 @@ class DnDCombatEnv(gym.Env):
 
         return self._get_obs(), self._get_info()
 
+    @property
+    def dice_roller(self):
+        return self.rules.dice_roller
+
+    @dice_roller.setter
+    def dice_roller(self, fn) -> None:
+        # Tests inject scripted dice by assigning env.dice_roller; the engine
+        # is the single owner, this property just forwards.
+        self.rules.dice_roller = fn
+
     def _calculate_manhattan_distance(self, pos1: List[int], pos2: List[int]) -> int:
-        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+        return self.rules.distance_between(pos1, pos2)
 
     def _is_valid_position(self, x: int, y: int) -> bool:
-        return 0 <= x < self.map_width and 0 <= y < self.map_height
+        return self.rules.is_valid_position(x, y)
 
-    @property # Make it accessible like a variable but defined as a method
+    @property
     def action_map(self):
-        # This property is what external things (like tests or example runners) might use.
-        # It should reflect the agent's perspective.
-        return self._agent_action_map
-
-    def _build_action_map_for_creature(self, creature: Creature) -> List[Dict[str, Any]]:
-        action_map = []
-        # 1. Move actions (NSEW, 1 cell at a time) - These are standard
-        action_map.append({"type": "move", "delta": (0, -1), "name": "move_N"}) # North
-        action_map.append({"type": "move", "delta": (0, 1), "name": "move_S"})  # South
-        action_map.append({"type": "move", "delta": (1, 0), "name": "move_E"})  # East
-        action_map.append({"type": "move", "delta": (-1, 0), "name": "move_W"}) # West
-
-        # 2. Attack actions - Specific to the creature
-        for i, attack_details in enumerate(creature.attacks):
-            action_map.append({"type": "attack", "index": i, "name": f"attack_{attack_details['name']}"})
-
-        # 3. Bonus Actions - Specific to the creature
-        for i, ba_name_or_dict in enumerate(creature.bonus_actions):
-            if isinstance(ba_name_or_dict, str):
-                action_map.append({"type": "bonus_action", "name": ba_name_or_dict, "index": i})
-            elif isinstance(ba_name_or_dict, dict): # If bonus actions become more structured
-                 action_map.append({
-                     "type": "bonus_action",
-                     "name": ba_name_or_dict.get("name", f"bonus_action_{i}"),
-                     "index": i,
-                     **ba_name_or_dict # Merge other details if any
-                 })
-
-        # 4. Standard D&D Actions available to every creature
-        action_map.append({"type": "dash", "name": "dash"})
-        action_map.append({"type": "disengage", "name": "disengage"})
-        action_map.append({"type": "dodge", "name": "dodge"})
-        action_map.append({"type": "stand_up", "name": "stand_up"})
-        action_map.append({"type": "hide", "name": "hide"})
-        action_map.append({"type": "search", "name": "search"})
-        # Special melee attacks (replace one attack of the Attack action)
-        action_map.append({"type": "shove_prone", "name": "shove_prone"})
-        action_map.append({"type": "shove_push", "name": "shove_push"})
-        action_map.append({"type": "grapple", "name": "grapple"})
-        action_map.append({"type": "escape_grapple", "name": "escape_grapple"})
-
-        # 4b. Trait-driven bonus actions (e.g. goblin Nimble Escape)
-        if "nimble_escape" in creature.traits:
-            action_map.append({"type": "bonus_disengage", "name": "bonus_disengage"})
-            action_map.append({"type": "bonus_hide", "name": "bonus_hide"})
-
-        # 5. End Turn action (hands the round over to the opponent)
-        action_map.append({"type": "end_turn", "name": "end_turn"})
-
-        return action_map
+        """The learner's action map (index 0 in the rules engine)."""
+        return self.rules.action_maps[0]
 
     def _decode_action(self, action_int: int, is_enemy: bool = False) -> Dict[str, Any]:
-        # Decode against the acting creature's own map (agent and enemy may
-        # have different attacks/bonus actions/traits).
-        map_to_use = self._enemy_action_map if is_enemy else self._agent_action_map
-
-        if not (0 <= action_int < len(map_to_use)):
-            if is_enemy:
-                # An enemy model trained against a different action space may
-                # predict an id we don't have; treat it as a pass instead of
-                # crashing the episode.
-                return {"type": "pass", "name": f"pass_invalid_action_id_{action_int}"}
-            actor_type = "enemy" if is_enemy else "agent"
-            map_type_used = "enemy_specific_map" if (is_enemy and self.enemy_is_model_controlled and self._enemy_action_map_for_validation is not None) else "agent_map"
-
-            err_msg = (
-                f"Invalid action integer: {action_int} for actor '{actor_type}'. "
-                f"Attempted to use {map_type_used} with size {len(map_to_use)}. "
-                f"Actor's actual attacks: {len(self.enemy.attacks if is_enemy else self.agent.attacks)}, "
-                f"Actor's actual bonus_actions: {len(self.enemy.bonus_actions if is_enemy else self.agent.bonus_actions)}."
-            )
-            move_actions_in_map = sum(1 for action in map_to_use if action["type"] == "move")
-            attack_actions_in_map = sum(1 for action in map_to_use if action["type"] == "attack")
-            bonus_actions_in_map = sum(1 for action in map_to_use if action["type"] == "bonus_action")
-            standard_actions_in_map = sum(1 for action in map_to_use if action["type"] in ["dash", "disengage", "dodge"])
-            pass_end_actions_in_map = sum(1 for action in map_to_use if action["type"] in ["pass_turn", "end_turn"])
-
-            err_msg += (
-                f" Map structure (used for decoding): Moves={move_actions_in_map}, Attacks={attack_actions_in_map}, "
-                f"BonusActions={bonus_actions_in_map}, StandardActions={standard_actions_in_map}, "
-                f"Pass/End={pass_end_actions_in_map}."
-            )
-            raise ValueError(err_msg)
-
-        action_details = map_to_use[action_int].copy()
-
-        actor = self.enemy if is_enemy else self.agent
-
-        if action_details["type"] == "attack":
-            attack_idx = action_details.get("index")
-            if attack_idx is None or not (0 <= attack_idx < len(actor.attacks)):
-                # Fallback if model chooses an attack index that the current actor doesn't have
-                return {"type": "pass", "name": f"pass_invalid_attack_idx_{attack_idx}"}
-            # Update name for clarity, index is used directly on actor's attack list
-            action_details["name"] = f"attack_{actor.attacks[attack_idx].get('name', f'idx{attack_idx}')}"
-        
-        elif action_details["type"] == "bonus_action":
-            bonus_idx = action_details.get("index")
-            if bonus_idx is None or not (0 <= bonus_idx < len(actor.bonus_actions)):
-                # Fallback for invalid bonus action index
-                return {"type": "pass", "name": f"pass_invalid_bonus_idx_{bonus_idx}"}
-            # Update name for clarity
-            action_details["name"] = f"bonus_{actor.bonus_actions[bonus_idx]}" # Assumes bonus_actions are strings (names)
-            # If bonus_actions were dicts, it would be: actor.bonus_actions[bonus_idx].get('name', f'idx{bonus_idx}')
-        
-        return action_details
-
-    def _first_melee_attack_index(self, creature: Creature) -> int:
-        for i, attack in enumerate(creature.attacks):
-            if attack.get("attack_type", "melee") == "melee":
-                return i
-        return -1
-
-    def _has_bonus_actions(self, creature: Creature) -> bool:
-        return bool(creature.bonus_actions) or "nimble_escape" in creature.traits
+        # Decode against the acting creature's own map (the two sides may have
+        # different attacks/bonus actions/traits). Lenient for the enemy seat:
+        # an opponent model trained against a different action space may
+        # predict ids this creature doesn't have.
+        return self.rules.decode_action(1 if is_enemy else 0, action_int, lenient=is_enemy)
 
     def _turn_economy_exhausted(self, creature: Creature) -> bool:
-        """True when the creature has nothing meaningful left to do this turn."""
-        bonus_done = creature.used_bonus_action_this_turn or not self._has_bonus_actions(creature)
-        return (creature.used_action_this_turn and bonus_done and
-                creature.speed_remaining <= 0 and creature.attacks_remaining <= 0)
+        return self.rules.turn_economy_exhausted(creature)
 
-    def _compute_action_mask(self, actor: Creature, opponent: Creature,
-                             action_map: List[Dict[str, Any]]) -> np.ndarray:
-        """Boolean mask of which actions in `action_map` would currently be
-        legal for `actor`. Mirrors the validity rules in
-        _execute_micro_action; end_turn is always legal so the mask is never
-        all-False."""
-        distance = self._calculate_manhattan_distance(actor.position, opponent.position)
-        move_cost = 2 if actor.has_condition("prone") else 1
-        has_attack_slot = (not actor.used_action_this_turn) or actor.attacks_remaining > 0
-
-        mask = np.zeros(len(action_map), dtype=bool)
-        for i, action in enumerate(action_map):
-            action_type = action["type"]
-            if action_type == "move":
-                dx, dy = action["delta"]
-                target_x, target_y = actor.position[0] + dx, actor.position[1] + dy
-                valid = (not actor.has_condition("grappled")
-                         and actor.speed_remaining >= move_cost
-                         and self._is_valid_position(target_x, target_y)
-                         and not ([target_x, target_y] == opponent.position and opponent.is_alive))
-            elif action_type == "attack":
-                idx = action.get("index", -1)
-                if not (0 <= idx < len(actor.attacks)) or not has_attack_slot:
-                    valid = False
-                else:
-                    stats = actor.attacks[idx]
-                    kind = stats.get("attack_type", "melee")
-                    lock_ok = (not actor.used_action_this_turn
-                               or actor.attack_type_lock is None
-                               or kind == actor.attack_type_lock)
-                    max_range = stats.get("range_long", stats.get("range", 1))
-                    valid = lock_ok and distance <= max_range
-            elif action_type == "bonus_action":
-                valid = (not actor.used_bonus_action_this_turn
-                         and 0 <= action.get("index", -1) < len(actor.bonus_actions))
-            elif action_type in ("dash", "disengage", "dodge"):
-                valid = not actor.used_action_this_turn
-            elif action_type == "stand_up":
-                valid = (actor.has_condition("prone")
-                         and actor.speed_remaining >= max(1, actor.speed_total // 2))
-            elif action_type == "hide":
-                valid = (not actor.used_action_this_turn
-                         and not actor.has_condition("hidden") and distance > 1)
-            elif action_type == "search":
-                valid = not actor.used_action_this_turn and opponent.has_condition("hidden")
-            elif action_type in ("shove_prone", "shove_push", "grapple"):
-                valid = distance <= 1 and has_attack_slot
-            elif action_type == "escape_grapple":
-                valid = actor.has_condition("grappled") and not actor.used_action_this_turn
-            elif action_type == "bonus_disengage":
-                valid = not actor.used_bonus_action_this_turn
-            elif action_type == "bonus_hide":
-                valid = (not actor.used_bonus_action_this_turn
-                         and not actor.has_condition("hidden") and distance > 1)
-            elif action_type == "end_turn":
-                valid = True
-            else:
-                valid = False
-            mask[i] = valid
-        return mask
+    def _max_micro_steps(self, creature: Creature) -> int:
+        return self.rules.micro_step_limit(creature)
 
     def action_masks(self) -> np.ndarray:
-        """sb3-contrib MaskablePPO hook: validity mask over the agent's actions."""
-        return self._compute_action_mask(self.agent, self.enemy, self._agent_action_map)
+        """sb3-contrib MaskablePPO hook: validity mask over the learner's actions."""
+        return self.rules.action_mask(0)
 
     # --- Spectator API: drive either combatant one micro-action at a time ---
     #
@@ -450,8 +305,8 @@ class DnDCombatEnv(gym.Env):
 
     def _side(self, prefix: str) -> Tuple[Creature, Creature, List[Dict[str, Any]]]:
         if prefix == 'agent':
-            return self.agent, self.enemy, self._agent_action_map
-        return self.enemy, self.agent, self._enemy_action_map
+            return self.agent, self.enemy, self.rules.action_maps[0]
+        return self.enemy, self.agent, self.rules.action_maps[1]
 
     def creature_for(self, prefix: str) -> Creature:
         """The Creature occupying a seat ('agent' = Agent 1, 'enemy' = Agent 2)."""
@@ -467,8 +322,7 @@ class DnDCombatEnv(gym.Env):
         return self._get_obs() if prefix == 'agent' else self._get_enemy_observation()
 
     def action_mask_for(self, prefix: str) -> np.ndarray:
-        actor, target, amap = self._side(prefix)
-        return self._compute_action_mask(actor, target, amap)
+        return self.rules.action_mask(0 if prefix == 'agent' else 1)
 
     def begin_turn(self, prefix: str) -> None:
         """Refresh a combatant's action economy at the start of its turn."""
@@ -492,572 +346,67 @@ class DnDCombatEnv(gym.Env):
                      or self._turn_economy_exhausted(actor))
         return terminated, turn_over, decoded
 
-    def _has_keen_senses(self, creature: Creature) -> bool:
-        return any(t.startswith("keen") for t in creature.traits)
-
-    def _attempt_hide(self, actor: Creature, target: Creature, info: Dict[str, Any], prefix: str) -> bool:
-        """Roll Stealth against the target's passive Perception.
-
-        Terrain does not exist yet, so hiding is abstracted: it may only be
-        attempted while not adjacent to the enemy (checked by callers), and it
-        shifts dice odds rather than concealing the hider's position.
-        """
-        stealth_mod = actor.skill_modifier("stealth", "dex")
-        roll_result = self.dice_roller("1d20") + stealth_mod
-        if roll_result >= target.passive_perception:
-            actor.conditions.add("hidden")
-            info[f'{prefix}_hide_outcome'] = (
-                f"Hidden (Stealth {roll_result} vs passive Perception {target.passive_perception}).")
-            return True
-        info[f'{prefix}_hide_outcome'] = (
-            f"Failed to hide (Stealth {roll_result} vs passive Perception {target.passive_perception}).")
-        return False
-
-    def _contested_check(self, initiator_mod: int, defender_mod: int) -> bool:
-        """Contested ability check; the initiator rolls first. Ties go to the
-        defender (the situation stays as it is, per the 5e contest rule)."""
-        initiator_roll = self.dice_roller("1d20") + initiator_mod
-        defender_roll = self.dice_roller("1d20") + defender_mod
-        return initiator_roll > defender_roll
-
-    def _best_escape_modifier(self, creature: Creature) -> int:
-        """Shove/grapple defenders may use Athletics (STR) or Acrobatics (DEX)."""
-        return max(creature.skill_modifier("athletics", "str"),
-                   creature.skill_modifier("acrobatics", "dex"))
-
-    def _push_away(self, pusher: Creature, target: Creature) -> bool:
-        """Forced movement: push the target one cell directly away from the
-        pusher (no movement cost to the target). Returns False if blocked."""
-        diff_x = target.position[0] - pusher.position[0]
-        diff_y = target.position[1] - pusher.position[1]
-        if abs(diff_x) >= abs(diff_y) and diff_x != 0:
-            delta = (1 if diff_x > 0 else -1, 0)
-        elif diff_y != 0:
-            delta = (0, 1 if diff_y > 0 else -1)
-        else:
-            return False
-        new_x = target.position[0] + delta[0]
-        new_y = target.position[1] + delta[1]
-        if self._is_valid_position(new_x, new_y):
-            target.position[0] = new_x
-            target.position[1] = new_y
-            return True
-        return False
-
-    def _update_proximity_conditions(self, info: Dict[str, Any]) -> None:
-        """Distance-dependent state, re-checked after any position change:
-        being adjacent reveals hidden creatures; a grapple ends when the
-        grappler is no longer within reach (moving away releases it)."""
-        distance = self._calculate_manhattan_distance(self.agent.position, self.enemy.position)
-        pairs = ((self.agent, "agent"), (self.enemy, "enemy"))
-        if distance <= 1:
-            for creature, label in pairs:
-                if creature.has_condition("hidden"):
-                    creature.conditions.discard("hidden")
-                    info[f'{label}_hidden_revealed'] = "Revealed by adjacency."
-        else:
-            for creature, label in pairs:
-                if creature.has_condition("grappled"):
-                    creature.conditions.discard("grappled")
-                    info[f'{label}_grapple_released'] = "Grapple ended (grappler out of reach)."
-
     def _resolve_attack_modifiers(self, attacker: Creature, defender: Creature,
                                   attack_stats: Dict[str, Any], distance: int,
                                   attacker_label: str, defender_label: str) -> Tuple[Optional[str], List[str]]:
-        """Collect every advantage/disadvantage source for an attack roll and
-        apply the 5e stacking rule: if both kinds are present — no matter how
-        many of each — the roll is straight.
-
-        Returns (status, messages) where status is 'advantage',
-        'disadvantage', or None.
-        """
-        advantage_sources: List[str] = []
-        disadvantage_sources: List[str] = []
-        attack_kind = attack_stats.get("attack_type", "melee")
-
-        # Ranged attack with an adjacent hostile creature
-        if attack_kind == "ranged" and distance <= 1:
-            disadvantage_sources.append(f"Ranged attack at disadvantage ({defender_label} adjacent).")
-
-        # Beyond normal range (up to long range)
-        range_normal = attack_stats.get("range", 1)
-        range_long = attack_stats.get("range_long")
-        if attack_kind == "ranged" and range_long and distance > range_normal:
-            disadvantage_sources.append("Attack at long range, disadvantage.")
-
-        # Defender is dodging
-        if defender.is_dodging:
-            disadvantage_sources.append(f"{defender_label.capitalize()} dodging, attack at disadvantage.")
-
-        # Defender is prone: advantage from within 5 ft, disadvantage beyond
-        if defender.has_condition("prone"):
-            if distance <= 1:
-                advantage_sources.append(f"{defender_label.capitalize()} prone, attack at advantage (adjacent).")
-            else:
-                disadvantage_sources.append(f"{defender_label.capitalize()} prone, attack at disadvantage (not adjacent).")
-
-        # Attacker is prone
-        if attacker.has_condition("prone"):
-            disadvantage_sources.append(f"{attacker_label.capitalize()} prone, attack at disadvantage.")
-
-        # Attacker is hidden (unseen attacker) — hidden lands in the stealth phase
-        if attacker.has_condition("hidden"):
-            advantage_sources.append(f"{attacker_label.capitalize()} attacks from hiding, advantage.")
-        # Defender is hidden (unseen target)
-        if defender.has_condition("hidden"):
-            disadvantage_sources.append(f"{defender_label.capitalize()} is hidden, attack at disadvantage.")
-
-        # pack_tactics: needs an ally adjacent to the defender — inert in 1v1
-        # combat, wired here so multi-creature support activates it.
-
-        messages = advantage_sources + disadvantage_sources
-        if advantage_sources and disadvantage_sources:
-            messages.append("Advantage and disadvantage cancel out.")
-            return None, messages
-        if advantage_sources:
-            return 'advantage', messages
-        if disadvantage_sources:
-            return 'disadvantage', messages
-        return None, []
-
-    def _max_micro_steps(self, creature: Creature) -> int:
-        # Enough for a full Dash turn (2x speed in single-cell moves) plus an
-        # action, a bonus action, and some slack. Bounds turn length so a
-        # policy repeating invalid actions cannot stall the round forever.
-        return 2 * creature.speed_total + 3
+        return self.rules.resolve_attack_modifiers(
+            attacker, defender, attack_stats, distance, attacker_label, defender_label)
 
     def _execute_micro_action(self, actor: Creature, target: Creature,
                               decoded_action: Dict[str, Any], info: Dict[str, Any],
                               prefix: str) -> Tuple[float, bool, bool]:
-        """Execute a single micro-action for `actor` against `target`.
+        """Adapter over CombatRules.execute(): resolve the action through the
+        rules engine, merge its notes into `info`, and translate what happened
+        into the learner's reward.
 
-        Shared by the agent and the (model- or rule-controlled) enemy so both
-        sides play by identical rules. Rewards are always from the agent's
-        perspective. Returns (reward_delta, terminated, action_succeeded).
+        The reward policy lives HERE, not in the engine: hp the opponent loses
+        is +reward, hp the learner loses is -reward, and a death ends the
+        episode at +/-100 depending on who fell. (`actor`/`target` are kept in
+        the signature for callers and tests; the seat is derived from
+        `prefix`.)
         """
-        is_agent = actor is self.agent
-        other_prefix = "enemy" if is_agent else "agent"
+        actor_idx = 0 if prefix == 'agent' else 1
+        result = self.rules.execute(actor_idx, decoded_action)
+        info.update(result.notes)
+
         reward_delta = 0.0
-        terminated = False
-        success = False
-        action_type = decoded_action["type"]
+        for _attacker_idx, victim_idx, damage in result.damage:
+            reward_delta += -damage if victim_idx == self.LEARNER_IDX else damage
+        for dead_idx in result.deaths:
+            reward_delta += -100 if dead_idx == self.LEARNER_IDX else 100
 
-        if action_type == "move":
-            dx, dy = decoded_action["delta"]
-            # Crawling while prone costs 1 extra cell of movement per cell.
-            cost = (abs(dx) + abs(dy)) * (2 if actor.has_condition("prone") else 1)
-            if actor.has_condition("grappled"):
-                info[f'{prefix}_move_outcome'] = "Cannot move while grappled."
-            elif actor.speed_remaining < cost:
-                info[f'{prefix}_move_outcome'] = "Not enough speed."
-            else:
-                target_x = actor.position[0] + dx
-                target_y = actor.position[1] + dy
-                if not self._is_valid_position(target_x, target_y):
-                    info[f'{prefix}_move_outcome'] = "Move out of bounds."
-                elif [target_x, target_y] == target.position and target.is_alive:
-                    info[f'{prefix}_move_outcome'] = f"Blocked by {other_prefix}."
-                else:
-                    # The move is definitely happening; resolve an opportunity
-                    # attack first if the actor is leaving the target's reach.
-                    if target.can_act() and \
-                       self._calculate_manhattan_distance(actor.position, target.position) == 1 and \
-                       self._calculate_manhattan_distance([target_x, target_y], target.position) > 1 and \
-                       not actor.is_disengaging and \
-                       not target.used_reaction_this_round:
-                        melee_idx = self._first_melee_attack_index(target)
-                        if melee_idx != -1:
-                            info[f'opportunity_attack_by_{other_prefix}'] = (
-                                f"{other_prefix.capitalize()} opportunity attack from {target.position} "
-                                f"as {prefix} moves from {actor.position} to {[target_x, target_y]}")
-                            oa_stats = target.attacks[melee_idx]
-                            oa_status, oa_messages = self._resolve_attack_modifiers(
-                                target, actor, oa_stats, 1, other_prefix, prefix)
-                            if oa_messages:
-                                info[f'opportunity_attack_by_{other_prefix}_modifier'] = " ".join(oa_messages)
-                            hp_before = actor.current_hp
-                            hit, _ = target.make_attack(actor, melee_idx, self.dice_roller,
-                                                        advantage_disadvantage=oa_status)
-                            target.used_reaction_this_round = True
-                            if target.has_condition("hidden"):
-                                target.conditions.discard("hidden")
-                                info[f'{other_prefix}_hidden_revealed'] = "Revealed by attacking."
-                            damage = hp_before - actor.current_hp
-                            if hit:
-                                reward_delta += -damage if is_agent else damage
-                                info[f'opportunity_attack_by_{other_prefix}_outcome'] = f"Hit, dealt {damage} damage."
-                            else:
-                                info[f'opportunity_attack_by_{other_prefix}_outcome'] = "Miss."
-                            if not actor.is_alive:
-                                terminated = True
-                                reward_delta += -100 if is_agent else 100
-                                info['combat_outcome'] = ("Agent died to Opportunity Attack" if is_agent
-                                                          else "Enemy died to Opportunity Attack")
-                                return reward_delta, terminated, False
-                    if actor.move(dx, dy, self.map_width, self.map_height, cost=cost):
-                        success = True
-                        info[f'{prefix}_move_outcome'] = f"Moved ({dx},{dy})."
-                        self._update_proximity_conditions(info)
-                    else:
-                        info[f'{prefix}_move_outcome'] = "Move failed unexpectedly."
-
-        elif action_type == "attack":
-            attack_idx = decoded_action["index"]
-            attack_stats = actor.attacks[attack_idx]
-            attack_kind = attack_stats.get("attack_type", "melee")
-
-            if actor.used_action_this_turn and actor.attacks_remaining <= 0:
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} tried Attack but action already used."
-                info[f'{prefix}_attack_outcome'] = "Action already used."
-            elif (actor.used_action_this_turn and actor.attack_type_lock is not None
-                  and attack_kind != actor.attack_type_lock):
-                info[f'{prefix}_action_details'] = (
-                    f"{prefix.capitalize()} Multiattack is locked to {actor.attack_type_lock} attacks this turn.")
-                info[f'{prefix}_attack_outcome'] = "Wrong attack type for Multiattack."
-            else:
-                if not actor.used_action_this_turn:
-                    # Taking the Attack action grants num_attacks attack rolls,
-                    # spent one micro-action at a time (Multiattack). The
-                    # melee/ranged type of the first attack locks the rest
-                    # ("two melee attacks or two ranged attacks").
-                    actor.used_action_this_turn = True
-                    actor.attacks_remaining = attack_stats.get("num_attacks", 1)
-                    actor.attack_type_lock = attack_kind if actor.attacks_remaining > 1 else None
-                actor.attacks_remaining -= 1
-
-                attack_name = attack_stats.get("name", f"Attack {attack_idx}")
-                attack_range = attack_stats.get("range", 1)
-                max_range = attack_stats.get("range_long", attack_range)
-                distance = self._calculate_manhattan_distance(actor.position, target.position)
-
-                adv_disadv, modifier_messages = self._resolve_attack_modifiers(
-                    actor, target, attack_stats, distance, prefix, other_prefix)
-                if modifier_messages:
-                    info[f'{prefix}_attack_modifier'] = " ".join(modifier_messages)
-
-                info[f'{prefix}_action_details'] = (
-                    f"Attack: {attack_name} (Range: {attack_range}/{max_range}, Type: {attack_kind}, "
-                    f"Adv/Disadv: {adv_disadv}), Target Dist: {distance}, Attacks left: {actor.attacks_remaining}")
-
-                if distance <= max_range:
-                    hp_before = target.current_hp
-                    hit, _ = actor.make_attack(target, attack_idx, self.dice_roller,
-                                               advantage_disadvantage=adv_disadv)
-                    if actor.has_condition("hidden"):
-                        # Attacking reveals you, hit or miss (advantage already applied)
-                        actor.conditions.discard("hidden")
-                        info[f'{prefix}_hidden_revealed'] = "Revealed by attacking."
-                    damage = hp_before - target.current_hp
-                    if hit:
-                        reward_delta += damage if is_agent else -damage
-                        info[f'{prefix}_attack_outcome'] = f"Hit, dealt {damage} damage."
-                    else:
-                        info[f'{prefix}_attack_outcome'] = "Miss."
-                    if not target.is_alive:
-                        terminated = True
-                        reward_delta += 100 if is_agent else -100
-                        info['combat_outcome'] = "Agent won" if is_agent else "Enemy won"
-                    elif hit:
-                        self._apply_on_hit_effects(attack_stats, target, info, prefix, other_prefix)
-                else:
-                    info[f'{prefix}_attack_outcome'] = "Out of range."
-                success = True
-
-        elif action_type == "bonus_action":
-            if actor.used_bonus_action_this_turn:
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} tried Bonus Action but it was already used."
-                info[f'{prefix}_bonus_outcome'] = "Bonus action already used."
-            else:
-                ba_name = decoded_action["name"]
-                info[f'{prefix}_action_details'] = f"Bonus Action: {ba_name}"
-                if ba_name == "bonus_move_1_cell":
-                    actor.speed_remaining += 1
-                    info[f'{prefix}_bonus_outcome'] = "Used bonus_move_1_cell, gained 1 speed."
-                else:
-                    info[f'{prefix}_bonus_outcome'] = f"Used bonus action: {ba_name} (effect placeholder)."
-                actor.used_bonus_action_this_turn = True
-                success = True
-
-        elif action_type in ("dash", "disengage", "dodge"):
-            if actor.used_action_this_turn:
-                info[f'{prefix}_action_details'] = (f"{prefix.capitalize()} tried {action_type.capitalize()} "
-                                                    f"but action already used.")
-            else:
-                if action_type == "dash":
-                    actor.took_dash_action_this_turn = True
-                    actor.speed_remaining += actor.speed_total
-                elif action_type == "disengage":
-                    actor.is_disengaging = True
-                else:
-                    actor.is_dodging = True
-                actor.used_action_this_turn = True
-                success = True
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} used {action_type.capitalize()} action."
-
-        elif action_type == "stand_up":
-            if not actor.has_condition("prone"):
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} tried to stand up but is not prone."
-            else:
-                cost = max(1, actor.speed_total // 2)  # Standing costs half your speed
-                if actor.speed_remaining >= cost:
-                    actor.speed_remaining -= cost
-                    actor.conditions.discard("prone")
-                    success = True
-                    info[f'{prefix}_action_details'] = f"{prefix.capitalize()} stood up (cost {cost} movement)."
-                else:
-                    info[f'{prefix}_action_details'] = (
-                        f"{prefix.capitalize()} cannot stand up (needs {cost} movement, "
-                        f"has {actor.speed_remaining}).")
-
-        elif action_type == "hide":
-            distance = self._calculate_manhattan_distance(actor.position, target.position)
-            if actor.used_action_this_turn:
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} tried Hide but action already used."
-            elif actor.has_condition("hidden"):
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} is already hidden."
-            elif distance <= 1:
-                info[f'{prefix}_action_details'] = (
-                    f"{prefix.capitalize()} cannot hide while adjacent to the {other_prefix}.")
-            else:
-                actor.used_action_this_turn = True
-                success = True  # the action is legal; the Stealth roll may still fail
-                self._attempt_hide(actor, target, info, prefix)
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} used Hide action."
-
-        elif action_type == "search":
-            if actor.used_action_this_turn:
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} tried Search but action already used."
-            elif not target.has_condition("hidden"):
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} searched but nothing is hidden."
-            else:
-                actor.used_action_this_turn = True
-                success = True
-                perception_mod = actor.skill_modifier("perception", "wis")
-                # Keen senses (hearing/sight/smell) grant advantage on the check
-                roll_str = "2d20kh1" if self._has_keen_senses(actor) else "1d20"
-                roll_result = self.dice_roller(roll_str) + perception_mod
-                dc = 10 + target.skill_modifier("stealth", "dex")
-                if roll_result >= dc:
-                    target.conditions.discard("hidden")
-                    info[f'{prefix}_search_outcome'] = (
-                        f"Found the {other_prefix} (Perception {roll_result} vs DC {dc}).")
-                else:
-                    info[f'{prefix}_search_outcome'] = (
-                        f"Search failed (Perception {roll_result} vs DC {dc}).")
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} used Search action."
-
-        elif action_type in ("shove_prone", "shove_push", "grapple"):
-            verb = "Grapple" if action_type == "grapple" else "Shove"
-            distance = self._calculate_manhattan_distance(actor.position, target.position)
-            if distance > 1:
-                info[f'{prefix}_action_details'] = (
-                    f"{prefix.capitalize()} tried {verb} but the {other_prefix} is out of reach.")
-            elif actor.used_action_this_turn and actor.attacks_remaining <= 0:
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} tried {verb} but action already used."
-            else:
-                # A special melee attack: replaces one attack of the Attack action.
-                if not actor.used_action_this_turn:
-                    actor.used_action_this_turn = True
-                    actor.attacks_remaining = max((a.get("num_attacks", 1) for a in actor.attacks), default=1)
-                actor.attacks_remaining -= 1
-                success = True
-                if actor.has_condition("hidden"):
-                    actor.conditions.discard("hidden")
-                    info[f'{prefix}_hidden_revealed'] = "Revealed by attacking."
-
-                attacker_mod = actor.skill_modifier("athletics", "str")
-                defender_mod = self._best_escape_modifier(target)
-                info[f'{prefix}_action_details'] = (
-                    f"{prefix.capitalize()} attempted {verb} "
-                    f"(Athletics {attacker_mod:+d} vs best of Athletics/Acrobatics {defender_mod:+d}).")
-                if self._contested_check(attacker_mod, defender_mod):
-                    if action_type == "grapple":
-                        target.conditions.add("grappled")
-                        info[f'{prefix}_contest_outcome'] = f"Grapple succeeded: {other_prefix} is grappled."
-                    elif action_type == "shove_prone":
-                        target.conditions.add("prone")
-                        info[f'{prefix}_contest_outcome'] = f"Shove succeeded: {other_prefix} is prone."
-                    else:  # shove_push
-                        if self._push_away(actor, target):
-                            info[f'{prefix}_contest_outcome'] = (
-                                f"Shove succeeded: {other_prefix} pushed to {target.position}.")
-                            self._update_proximity_conditions(info)
-                        else:
-                            info[f'{prefix}_contest_outcome'] = (
-                                f"Shove succeeded but the {other_prefix} has nowhere to go.")
-                else:
-                    info[f'{prefix}_contest_outcome'] = f"{verb} failed (contest lost)."
-
-        elif action_type == "escape_grapple":
-            if not actor.has_condition("grappled"):
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} tried to escape but is not grappled."
-            elif actor.used_action_this_turn:
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} tried to escape but action already used."
-            else:
-                actor.used_action_this_turn = True
-                success = True
-                escaper_mod = self._best_escape_modifier(actor)
-                grappler_mod = target.skill_modifier("athletics", "str")
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} tried to escape the grapple."
-                if self._contested_check(escaper_mod, grappler_mod):
-                    actor.conditions.discard("grappled")
-                    info[f'{prefix}_contest_outcome'] = "Escaped the grapple."
-                else:
-                    info[f'{prefix}_contest_outcome'] = "Failed to escape the grapple."
-
-        elif action_type in ("bonus_disengage", "bonus_hide"):
-            distance = self._calculate_manhattan_distance(actor.position, target.position)
-            if "nimble_escape" not in actor.traits:
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} lacks Nimble Escape."
-            elif actor.used_bonus_action_this_turn:
-                info[f'{prefix}_action_details'] = (
-                    f"{prefix.capitalize()} tried Bonus Action but it was already used.")
-            elif action_type == "bonus_hide" and actor.has_condition("hidden"):
-                info[f'{prefix}_action_details'] = f"{prefix.capitalize()} is already hidden."
-            elif action_type == "bonus_hide" and distance <= 1:
-                info[f'{prefix}_action_details'] = (
-                    f"{prefix.capitalize()} cannot hide while adjacent to the {other_prefix}.")
-            else:
-                actor.used_bonus_action_this_turn = True
-                success = True
-                if action_type == "bonus_disengage":
-                    actor.is_disengaging = True
-                    info[f'{prefix}_action_details'] = (
-                        f"{prefix.capitalize()} used Nimble Escape: Disengage (bonus action).")
-                else:
-                    self._attempt_hide(actor, target, info, prefix)
-                    info[f'{prefix}_action_details'] = (
-                        f"{prefix.capitalize()} used Nimble Escape: Hide (bonus action).")
-
-        elif action_type == "end_turn":
-            success = True
-            info[f'{prefix}_action_details'] = f"{prefix.capitalize()} ended turn."
-
-        elif action_type == "pass":
-            # Fallback from _decode_action for an index this creature doesn't have.
-            info[f'{prefix}_action_details'] = (f"{prefix.capitalize()} chose an action invalid for this "
-                                                f"creature; treated as pass.")
-
-        return reward_delta, terminated, success
-
-    def _apply_on_hit_effects(self, attack_stats: Dict[str, Any], target: Creature,
-                              info: Dict[str, Any], prefix: str, other_prefix: str) -> None:
-        """Resolve riders like the wolf bite's 'DC 11 STR save or prone'."""
-        for effect in attack_stats.get("on_hit_effects", []):
-            save_spec = effect.get("save")
-            if not save_spec or not target.is_alive:
-                continue
-            ability = save_spec["ability"]
-            dc = save_spec["dc"]
-            if target.saving_throw(ability, dc, self.dice_roller):
-                info[f'{prefix}_rider_outcome'] = (
-                    f"{other_prefix.capitalize()} succeeded on DC {dc} {ability.upper()} save.")
-            else:
-                condition = effect.get("on_fail", {}).get("condition")
-                if condition:
-                    target.conditions.add(condition)
-                info[f'{prefix}_rider_outcome'] = (
-                    f"{other_prefix.capitalize()} failed DC {dc} {ability.upper()} save"
-                    + (f" and is {condition}." if condition else "."))
+        terminated = bool(result.deaths)
+        return reward_delta, terminated, result.success
 
     def _run_enemy_turn(self, info: Dict[str, Any]) -> Tuple[float, bool]:
-        """Run the enemy's complete turn. Returns (reward_delta, terminated)."""
-        self.enemy.start_new_turn()
-        if self.enemy_is_model_controlled and self.enemy_model and self.enemy_obs_flattener:
-            return self._run_enemy_model_turn(info)
-        return self._run_enemy_rule_based_turn(info)
-
-    def _run_enemy_micro(self, decoded: Dict[str, Any],
-                         info: Dict[str, Any]) -> Tuple[float, bool, bool]:
-        """Execute and log one enemy micro-action. Each call gets a fresh
-        outcome dict so its log line reflects only this action (multiattack
-        and multi-cell moves would otherwise overwrite each other in info),
-        then merges into the step's info for the return value."""
-        sub: Dict[str, Any] = {}
-        r, terminated, success = self._execute_micro_action(self.enemy, self.agent, decoded, sub, 'enemy')
-        info.update(sub)
-        self._log_micro_action('enemy', decoded, sub)
-        return r, terminated, success
-
-    def _run_enemy_model_turn(self, info: Dict[str, Any]) -> Tuple[float, bool]:
-        info['enemy_ai_type'] = 'model_controlled'
+        """Run the opponent's complete turn, one policy-chosen micro-action at
+        a time. The policy (rule-based or model) only chooses; execution and
+        logging go through the exact same path for both. Returns
+        (reward_delta, terminated)."""
+        self.rules.begin_turn(1)
+        info['enemy_ai_type'] = self.enemy_policy.kind
         reward_delta = 0.0
         terminated = False
-        for _ in range(self._max_micro_steps(self.enemy)):
-            enemy_obs_dict = self._get_enemy_observation()
-            flat_enemy_obs = self.enemy_obs_flattener.observation(enemy_obs_dict)
-            if MASKABLE_AVAILABLE and isinstance(self.enemy_model, MaskablePPO):
-                enemy_mask = self._compute_action_mask(
-                    self.enemy, self.agent, self._enemy_action_map_for_validation)
-                enemy_action_id_array, _ = self.enemy_model.predict(
-                    flat_enemy_obs, deterministic=True, action_masks=enemy_mask)
-            else:
-                enemy_action_id_array, _ = self.enemy_model.predict(flat_enemy_obs, deterministic=True)
-            enemy_action_id = int(enemy_action_id_array.item())
-            decoded = self._decode_action(enemy_action_id, is_enemy=True)
+        for _ in range(self.rules.micro_step_limit(self.enemy)):
+            decoded = self.enemy_policy.choose(self.rules, 1)
+            if decoded is None:
+                break  # the policy has nothing more to do this turn
 
-            r, terminated, success = self._run_enemy_micro(decoded, info)
+            # Fresh outcome dict so each micro-action logs on its own line
+            # (multiattack and multi-cell moves would overwrite each other).
+            sub: Dict[str, Any] = {}
+            r, terminated, success = self._execute_micro_action(
+                self.enemy, self.agent, decoded, sub, 'enemy')
+            info.update(sub)
+            self._log_micro_action('enemy', decoded, sub)
             reward_delta += r
+
             if terminated or decoded["type"] == "end_turn" or self._turn_economy_exhausted(self.enemy):
                 break
             if not success:
-                # A failed action leaves the observation unchanged, so a
+                # A failed action leaves the state unchanged, so a
                 # deterministic policy would repeat it forever; end the turn.
                 break
-        return reward_delta, terminated
-
-    def _run_enemy_rule_based_turn(self, info: Dict[str, Any]) -> Tuple[float, bool]:
-        info['enemy_ai_type'] = 'rule_based'
-        reward_delta = 0.0
-        terminated = False
-        attack_stats = self.enemy.attacks[0] if self.enemy.attacks else None
-        attack_range = attack_stats.get("range", 1) if attack_stats else 1
-
-        # Stand up first if prone (costs half speed; crawling costs double).
-        if self.enemy.has_condition("prone"):
-            r, terminated, _ = self._run_enemy_micro({"type": "stand_up", "name": "stand_up"}, info)
-            reward_delta += r
-
-        # If the agent is hidden, spend the action searching for it rather
-        # than attacking at disadvantage.
-        if not terminated and self.agent.has_condition("hidden") and not self.enemy.used_action_this_turn:
-            r, terminated, _ = self._run_enemy_micro({"type": "search", "name": "search"}, info)
-            reward_delta += r
-
-        # Close distance until within attack range (or adjacent if unarmed).
-        while (not terminated and self.enemy.speed_remaining > 0 and
-               self._calculate_manhattan_distance(self.enemy.position, self.agent.position) > attack_range):
-            diff_x = self.agent.position[0] - self.enemy.position[0]
-            diff_y = self.agent.position[1] - self.enemy.position[1]
-            step_x = (1 if diff_x > 0 else -1, 0) if diff_x != 0 else None
-            step_y = (0, 1 if diff_y > 0 else -1) if diff_y != 0 else None
-            ordered = (step_x, step_y) if abs(diff_x) >= abs(diff_y) else (step_y, step_x)
-            candidate_steps = [s for s in ordered if s is not None]
-
-            moved = False
-            for delta in candidate_steps:
-                decoded = {"type": "move", "delta": delta, "name": f"move({delta[0]},{delta[1]})"}
-                r, terminated, success = self._run_enemy_micro(decoded, info)
-                reward_delta += r
-                if terminated:
-                    return reward_delta, terminated
-                if success:
-                    moved = True
-                    break
-            if not moved:
-                break  # Boxed in; stop trying to move.
-
-        # Attack while in range, spending every Multiattack slot.
-        while (not terminated and attack_stats and self.agent.is_alive and
-               (not self.enemy.used_action_this_turn or self.enemy.attacks_remaining > 0) and
-               self._calculate_manhattan_distance(self.enemy.position, self.agent.position) <= attack_range):
-            decoded = {"type": "attack", "index": 0,
-                       "name": f"attack_{attack_stats.get('name', '0')}"}
-            r, terminated, success = self._run_enemy_micro(decoded, info)
-            reward_delta += r
-            if not success:
-                break
-
         return reward_delta, terminated
 
     def _role_label(self, prefix: str) -> str:
