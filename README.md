@@ -14,18 +14,22 @@ alternating self-play.
 
 | File / dir | Purpose |
 |---|---|
-| [dnd_gym_env.py](dnd_gym_env.py) | The core module: `Creature` (stats + combat state) and `DnDCombatEnv` (the Gymnasium environment, including pygame rendering and optional model-controlled enemy). |
-| [dice.py](dice.py) | Dice-string roller, e.g. `1d8+3`, `2d20kh1` (advantage), `2d20kl1` (disadvantage). |
-| [bestiary/](bestiary/) | Creature stat blocks (`commoner`, `wolf`, `cat`, `bandit`, `guard`, `goblin`, `scout`). Each module exposes `get_<name>_stats()` returning a dict of AC, HP, speed, attacks, and bonus actions. |
+| [sunztu/env.py](sunztu/env.py) | `DnDCombatEnv` — the Gymnasium environment: turn structure, combat rules executor, observations, action masks, opponent AIs, and the spectator API. |
+| [sunztu/creature.py](sunztu/creature.py) | The `Creature` data model: stats, action economy, conditions, attack rolls, saving throws. |
+| [sunztu/dice.py](sunztu/dice.py) | Dice-string roller, e.g. `1d8+3`, `2d20kh1` (advantage), `2d20kl1` (disadvantage). |
+| [sunztu/render.py](sunztu/render.py) | All pygame rendering (tokens, badges, stats/log panel). Only imported for `human`/`rgb_array` modes, so headless training has no pygame dependency. |
+| [sunztu/models.py](sunztu/models.py) | Algorithm-agnostic checkpoint loading (`load_model_any` handles MaskablePPO and legacy DQN zips). |
+| [sunztu/spectator.py](sunztu/spectator.py) | Shared symmetric driving loop used by `run_env.py` and `evaluate_models.py`, so what you watch is exactly what gets scored. |
+| [sunztu/training.py](sunztu/training.py) | Shared trainer setup: vectorized env stack (FlattenObservation → DummyVecEnv → VecNormalize) and default PPO hyperparameters. |
+| [bestiary/](bestiary/) | Creature stat blocks (`commoner`, `wolf`, `cat`, `bandit`, `guard`, `goblin`, `scout`) plus token art. Each module exposes `get_<name>_stats()`; the package exposes `get_stats(name)` and `load_stats_from_module(path)`. |
 | [train_agent.py](train_agent.py) | Trains a single MaskablePPO agent (guard vs. wolf by default) against the rule-based enemy or a saved enemy model, then runs a 20-episode evaluation. |
 | [train_alternating.py](train_alternating.py) | Alternating self-play with MaskablePPO: trains model A against the latest model B, then B against the updated A, for N iterations. |
 | [evaluate_models.py](evaluate_models.py) | Scores two policies head-to-head over many episodes, driving both sides symmetrically (same loop as the viewer). Either side may be left model-less to act randomly as a baseline; `--swap_sides` also runs the mirror matchup to cancel out the first-turn advantage. |
-| [spectator.py](spectator.py) | Shared symmetric driving loop used by `run_env.py` and `evaluate_models.py`, so what you watch is exactly what gets scored. |
-| [run_env.py](run_env.py) | Symmetric spectator: drives **both** combatants itself one micro-action at a time (via the env's spectator API), so every micro-action — including each of the opponent's moves — gets its own frame and log line. Creature-art tokens with name labels and condition badges, framed as **Agent 1** and **Agent 2**. Each side is model-controlled if given a model (`--agent1_model`/`--agent2_model`), else random. Selectable matchup (`--agent1_creature`/`--agent2_creature`), optional per-micro-action PNG export. |
-| [test_dice.py](test_dice.py), [test_dnd_gym_env.py](test_dnd_gym_env.py) | Pytest suites for the dice roller and the environment. |
-| `models/` | Saved `.zip` DQN checkpoints from past runs. **Note:** checkpoints predating the turn-structure fix (see below) were trained on broken dynamics and a different action-space size; they should be retrained. |
-| `dnd_dqn_tensorboard/`, `dnd_selfplay_tensorboard/` | TensorBoard logs from past runs. |
-| `run_env_output/` | Exported PNG frames from `run_env.py` runs. |
+| [run_env.py](run_env.py) | Symmetric spectator: drives **both** combatants one micro-action at a time, so every micro-action — including each of the opponent's moves — gets its own frame and log line. Creature-art tokens with name labels and condition badges, framed as **Agent 1** and **Agent 2**. Each side is model-controlled if given a model (`--agent1_model`/`--agent2_model`), else random. Selectable matchup (`--agent1_creature`/`--agent2_creature`), optional per-micro-action PNG export. |
+| [tests/](tests/) | Pytest suite, split by area (`test_creature`, `test_env_core`, `test_mechanics`, `test_masks`, `test_dice`) with shared fixtures in `conftest.py`. |
+| [dnd_gym_env.py](dnd_gym_env.py) | Deprecated compatibility shim re-exporting the old names from the `sunztu` package. |
+| `models/` | Saved `.zip` checkpoints. **Note:** checkpoints predating the turn-structure fix (see below) were trained on broken dynamics and a different action-space size; they should be retrained. |
+| `dnd_ppo_tensorboard/`, `dnd_selfplay_tensorboard/` | TensorBoard logs from training runs. |
 
 ## How the environment works
 
@@ -186,7 +190,7 @@ python run_env.py --agent1_creature wolf --agent2_creature goblin \
     --agent2_model models/dnd_agent2_selfplay.zip   # trained self-play models fight
 
 # Run tests
-pytest test_dice.py test_dnd_gym_env.py
+pytest
 ```
 
 TensorBoard: `tensorboard --logdir dnd_dqn_tensorboard` (or

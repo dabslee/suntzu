@@ -16,7 +16,7 @@ from typing import Dict, Optional, Tuple, Callable, Any
 
 import numpy as np
 
-from dnd_gym_env import load_model_any, MASKABLE_AVAILABLE
+from sunztu.models import load_model_any, MASKABLE_AVAILABLE
 
 try:
     from sb3_contrib import MaskablePPO

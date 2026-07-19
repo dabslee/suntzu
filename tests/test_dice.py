@@ -1,5 +1,5 @@
 import pytest
-from dice import roll # Assuming dice.py is in the same directory or PYTHONPATH
+from sunztu.dice import roll
 
 # Test cases for valid dice strings
 VALID_ROLLS_SPECS = [

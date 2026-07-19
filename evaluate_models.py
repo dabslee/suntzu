@@ -10,9 +10,7 @@ Either side may be left without a model to act randomly, which is a useful
 baseline (a trained policy should comfortably beat random).
 """
 import argparse
-import importlib
 import time
-from typing import Optional
 
 import numpy as np
 
@@ -23,25 +21,9 @@ except ImportError:
     SB3_AVAILABLE = False
     print("Warning: gymnasium not found. Evaluation script will not work.")
 
-from dnd_gym_env import DnDCombatEnv
-import spectator
-
-
-def load_stats_from_module(module_path_str: str) -> dict:
-    """Import e.g. 'bestiary.wolf' and call its get_wolf_stats()."""
-    creature = module_path_str.split('.')[-1]
-    expected_func_name = f"get_{creature}_stats"
-    try:
-        module = importlib.import_module(module_path_str)
-        stats_func = getattr(module, expected_func_name)
-    except ImportError:
-        print(f"Error: could not import module '{module_path_str}'.")
-        raise
-    except AttributeError:
-        print(f"Error: could not find '{expected_func_name}' in '{module_path_str}'.")
-        raise
-    print(f"Loaded stats function '{expected_func_name}' from '{module_path_str}'")
-    return stats_func()
+from bestiary import load_stats_from_module
+from sunztu.env import DnDCombatEnv
+from sunztu import spectator
 
 
 def parse_arguments():

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sunztu"
+version = "0.1.0"
+description = "RL agents for D&D 5e-style grid combat (Gymnasium + MaskablePPO)"
+requires-python = ">=3.10"
+dependencies = [
+    "gymnasium",
+    "numpy",
+    "pygame",
+    "stable-baselines3",
+    "sb3-contrib",
+    "tensorboard",
+]
+
+[tool.setuptools]
+packages = ["sunztu", "bestiary"]
+
+[tool.setuptools.package-data]
+bestiary = ["tokens/*.webp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Make `sunztu` and `bestiary` importable when running pytest from the repo
+# root without an editable install.
+pythonpath = ["."]

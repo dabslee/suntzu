@@ -17,15 +17,9 @@ import numpy as np
 from gymnasium.wrappers import FlattenObservation
 from gymnasium.utils.env_checker import check_env
 
-import bestiary
-import spectator
-from dnd_gym_env import DnDCombatEnv
-
-CREATURES = ["bandit", "cat", "commoner", "goblin", "guard", "scout", "wolf"]
-
-
-def get_stats(creature_name: str) -> dict:
-    return getattr(bestiary, f"get_{creature_name}_stats")()
+from bestiary import CREATURES, get_stats
+from sunztu import spectator
+from sunztu.env import DnDCombatEnv
 
 
 def main(agent1_creature: str, agent2_creature: str,

@@ -9,12 +9,11 @@ import os
 import argparse
 from typing import Optional
 
-import gymnasium as gym
 from sb3_contrib import MaskablePPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from gymnasium.wrappers import FlattenObservation
 
-from dnd_gym_env import DnDCombatEnv
+from sunztu.env import DnDCombatEnv
+from sunztu.training import DEFAULT_PPO_HYPERPARAMS, make_training_vec_env
 from bestiary.guard import get_guard_stats
 from bestiary.wolf import get_wolf_stats
 
@@ -62,31 +61,12 @@ if __name__ == "__main__":
     print(f"Enemy: {'model ' + args.enemy_model_path if args.enemy_model_path else 'rule-based AI'}")
 
     print(f"Creating {args.n_envs} vectorized training environments...")
-    # VecNormalize(norm_reward=True) rescales the +/-100 terminal rewards for
-    # PPO's value function — without it PPO plateaus at ~0% wins. Observations
-    # are NOT normalized, so the saved policy works standalone at inference.
-    vec_env = VecNormalize(
-        DummyVecEnv(
-            # Only the first env copy logs its setup (they are identical)
-            [(lambda v=(i == 0): FlattenObservation(
-                make_env(enemy_model_path_arg=args.enemy_model_path, verbose_arg=v)))
-             for i in range(args.n_envs)]),
-        norm_obs=False, norm_reward=True, gamma=0.99)
+    vec_env = make_training_vec_env(AGENT_STATS, ENEMY_STATS, args.enemy_model_path,
+                                    args.n_envs, MAP_WIDTH, MAP_HEIGHT)
 
     print("Defining the MaskablePPO model...")
-    model = MaskablePPO(
-        "MlpPolicy",
-        vec_env,
-        verbose=1,
-        learning_rate=3e-4,
-        n_steps=256,        # rollout length per env (n_envs * n_steps per update)
-        batch_size=512,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        ent_coef=0.01,      # entropy bonus for exploration
-        tensorboard_log=LOG_DIR
-    )
+    model = MaskablePPO("MlpPolicy", vec_env, verbose=1,
+                        tensorboard_log=LOG_DIR, **DEFAULT_PPO_HYPERPARAMS)
 
     print(f"Starting training for {args.total_timesteps} timesteps...")
     model.learn(total_timesteps=args.total_timesteps, log_interval=10, progress_bar=True)

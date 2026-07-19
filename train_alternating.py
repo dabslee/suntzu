@@ -11,63 +11,28 @@ be resumed (they can still be used as *opponents* via enemy_model_path).
 """
 import os
 import argparse
-import importlib
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 try:
     from sb3_contrib import MaskablePPO
-    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-    from gymnasium.wrappers import FlattenObservation
     SB3_AVAILABLE = True
 except ImportError:
     SB3_AVAILABLE = False
     print("Warning: sb3-contrib not found. Install with: pip install sb3-contrib")
 
 try:
-    from dnd_gym_env import DnDCombatEnv
+    from bestiary import load_stats_from_module
+    from sunztu.training import DEFAULT_PPO_HYPERPARAMS, make_training_vec_env
     PROJECT_ENV_AVAILABLE = True
 except ImportError:
     PROJECT_ENV_AVAILABLE = False
-    print("Warning: dnd_gym_env not found. Script cannot run as intended.")
+    print("Warning: sunztu package not found. Script cannot run as intended.")
 
 DEFAULT_MODEL_A_PATH = "models/dnd_agent1_selfplay.zip"
 DEFAULT_MODEL_B_PATH = "models/dnd_agent2_selfplay.zip"
 
-MAP_WIDTH = 10
-MAP_HEIGHT = 10
-
 LOG_DIR_BASE = "./dnd_selfplay_tensorboard/"
 os.makedirs(LOG_DIR_BASE, exist_ok=True)
-
-
-def load_stats_from_module(module_path_str: str) -> dict:
-    actual_module_name = module_path_str.split('.')[-1]
-    expected_func_name = f"get_{actual_module_name}_stats"
-    module = importlib.import_module(module_path_str)
-    stats_func = getattr(module, expected_func_name)
-    print(f"Loaded stats function '{expected_func_name}' from '{module_path_str}'")
-    return stats_func()
-
-
-def make_vec_env(agent_stats: Dict[str, Any], enemy_stats: Dict[str, Any],
-                 opponent_model_path: Optional[str], n_envs: int) -> "DummyVecEnv":
-    """N copies of the env in one process: MaskablePPO batches the policy
-    forward pass across them, which is where the speedup comes from."""
-    def make_one(env_verbose: bool = False):
-        env = DnDCombatEnv(
-            map_width=MAP_WIDTH, map_height=MAP_HEIGHT,
-            agent_stats=agent_stats, enemy_stats=enemy_stats,
-            enemy_model_path=opponent_model_path, render_mode=None,
-            verbose=env_verbose)  # only the first env copy logs its setup
-        return FlattenObservation(env)
-    factories = [(lambda v=(i == 0): make_one(v)) for i in range(n_envs)]
-    # VecNormalize(norm_reward=True) rescales the +/-100 terminal rewards for
-    # PPO's value function — without it PPO plateaus at ~0% wins. Observations
-    # are NOT normalized, so saved policies work standalone at inference (and
-    # as enemy models). Reward running stats restart each iteration, which is
-    # fine since the opponent (and thus the reward distribution) changes too.
-    return VecNormalize(DummyVecEnv(factories),
-                        norm_obs=False, norm_reward=True, gamma=0.99)
 
 
 def initialize_model(model_path: str, vec_env: "DummyVecEnv",
@@ -104,17 +69,20 @@ if __name__ == '__main__':
                         help=f"Path to load/save Agent 1 model. Default: {DEFAULT_MODEL_A_PATH}")
     parser.add_argument("--model_b_path", type=str, default=DEFAULT_MODEL_B_PATH,
                         help=f"Path to load/save Agent 2 model. Default: {DEFAULT_MODEL_B_PATH}")
-    # PPO hyperparameters
+    # PPO hyperparameters (defaults from sunztu.training.DEFAULT_PPO_HYPERPARAMS)
+    hp = DEFAULT_PPO_HYPERPARAMS
     parser.add_argument("--n_envs", type=int, default=8,
                         help="Vectorized envs per model (batched inference). Default: 8")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate. Default: 3e-4")
-    parser.add_argument("--n_steps", type=int, default=256,
-                        help="Rollout length per env before each update. Default: 256")
-    parser.add_argument("--batch_size", type=int, default=512,
-                        help="Minibatch size (must divide n_envs * n_steps). Default: 512")
-    parser.add_argument("--n_epochs", type=int, default=10, help="PPO epochs per update. Default: 10")
-    parser.add_argument("--ent_coef", type=float, default=0.01,
-                        help="Entropy bonus (exploration). Default: 0.01")
+    parser.add_argument("--lr", type=float, default=hp["learning_rate"],
+                        help=f"Learning rate. Default: {hp['learning_rate']}")
+    parser.add_argument("--n_steps", type=int, default=hp["n_steps"],
+                        help=f"Rollout length per env before each update. Default: {hp['n_steps']}")
+    parser.add_argument("--batch_size", type=int, default=hp["batch_size"],
+                        help=f"Minibatch size (must divide n_envs * n_steps). Default: {hp['batch_size']}")
+    parser.add_argument("--n_epochs", type=int, default=hp["n_epochs"],
+                        help=f"PPO epochs per update. Default: {hp['n_epochs']}")
+    parser.add_argument("--ent_coef", type=float, default=hp["ent_coef"],
+                        help=f"Entropy bonus (exploration). Default: {hp['ent_coef']}")
     args = parser.parse_args()
 
     if (args.n_envs * args.n_steps) % args.batch_size != 0:
@@ -130,12 +98,11 @@ if __name__ == '__main__':
     print("------------------------------------------------------")
 
     ppo_hyperparameters = {
+        **DEFAULT_PPO_HYPERPARAMS,
         "learning_rate": args.lr,
         "n_steps": args.n_steps,
         "batch_size": args.batch_size,
         "n_epochs": args.n_epochs,
-        "gamma": 0.99,
-        "gae_lambda": 0.95,
         "ent_coef": args.ent_coef,
     }
 
@@ -161,7 +128,7 @@ if __name__ == '__main__':
         opponent_b = args.model_b_path if os.path.exists(args.model_b_path) else None
         print(f"\nTraining Agent 1 ({agent1_name}) vs "
               f"{'model ' + opponent_b if opponent_b else 'rule-based ' + agent2_name}...")
-        vec_env_a = make_vec_env(agent1_stats_data, agent2_stats_data, opponent_b, args.n_envs)
+        vec_env_a = make_training_vec_env(agent1_stats_data, agent2_stats_data, opponent_b, args.n_envs)
         if model_a is None:
             model_a = initialize_model(args.model_a_path, vec_env_a, ppo_hyperparameters)
         else:
@@ -174,7 +141,7 @@ if __name__ == '__main__':
 
         # --- Train Agent 2 against the updated Agent 1 ---
         print(f"\nTraining Agent 2 ({agent2_name}) vs model {args.model_a_path}...")
-        vec_env_b = make_vec_env(agent2_stats_data, agent1_stats_data, args.model_a_path, args.n_envs)
+        vec_env_b = make_training_vec_env(agent2_stats_data, agent1_stats_data, args.model_a_path, args.n_envs)
         if model_b is None:
             model_b = initialize_model(args.model_b_path, vec_env_b, ppo_hyperparameters)
         else:
